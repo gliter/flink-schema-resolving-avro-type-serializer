@@ -1,0 +1,1 @@
+schema.resolving.avro.schema.registry.url: mock://flink-it-registry

@@ -1,0 +1,40 @@
+name: Release to Maven Central
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    environment: release
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "17"
+      - uses: gradle/actions/setup-gradle@v4
+      - name: Verify tag matches the computed artifact version
+        if: github.event_name == 'push'
+        run: |
+          VERSION=$(./gradlew -q properties | awk -F': ' '/^version:/{print $2}')
+          test "${GITHUB_REF_NAME}" = "v${VERSION}"
+      - name: Build, test, sign, and bundle
+        run: ./gradlew check centralBundle --stacktrace
+        env:
+          SIGNING_KEY: ${{ secrets.SIGNING_KEY }}
+          SIGNING_PASSWORD: ${{ secrets.SIGNING_PASSWORD }}
+      - name: Upload to Sonatype Central
+        run: |
+          curl --fail-with-body --request POST \
+            --header "Authorization: Bearer $CENTRAL_TOKEN" \
+            --form bundle=@build/distributions/central-bundle.zip \
+            "https://central.sonatype.com/api/v1/publisher/upload?name=${GITHUB_REF_NAME:-manual}&publishingType=AUTOMATIC"
+        env:
+          CENTRAL_TOKEN: ${{ secrets.CENTRAL_TOKEN }}
