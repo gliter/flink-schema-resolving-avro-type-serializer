@@ -1,5 +1,7 @@
 # Schema-Resolving Avro Serializer for Flink
 
+=== THIS IS WORK IN PROGRESS ==
+
 [![Build](https://github.com/gliter/flink-confluent-avro-type-serializer/actions/workflows/build.yml/badge.svg)](https://github.com/gliter/flink-confluent-avro-type-serializer/actions/workflows/build.yml)
 
 Need to add an Avro field to a Flink job? A regular Flink Avro serializer can require a full state rewrite after a schema change. For large state, that can take hours.
