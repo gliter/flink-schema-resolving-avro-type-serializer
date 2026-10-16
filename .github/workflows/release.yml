@@ -13,6 +13,7 @@ jobs:
   publish:
     runs-on: ubuntu-latest
     environment: release
+    timeout-minutes: 35
     strategy:
       fail-fast: false
       matrix:
@@ -37,9 +38,58 @@ jobs:
           SIGNING_PASSWORD: ${{ secrets.SIGNING_PASSWORD }}
       - name: Upload to Sonatype Central
         run: |
-          curl --fail-with-body --request POST \
+          DEPLOYMENT_ID=$(curl --fail-with-body --silent --show-error --request POST \
             --header "Authorization: Bearer $CENTRAL_TOKEN" \
             --form bundle=@build/distributions/central-bundle.zip \
-            "https://central.sonatype.com/api/v1/publisher/upload?name=${GITHUB_REF_NAME:-manual}-flink-${{ matrix.flink-version }}&publishingType=AUTOMATIC"
+            "https://central.sonatype.com/api/v1/publisher/upload?name=${GITHUB_REF_NAME:-manual}-flink-${{ matrix.flink-version }}&publishingType=AUTOMATIC")
+          echo "Central deployment ID: $DEPLOYMENT_ID"
+
+          for attempt in $(seq 1 180); do
+            STATUS_RESPONSE=$(curl --fail-with-body --silent --show-error --request POST \
+              --header "Authorization: Bearer $CENTRAL_TOKEN" \
+              "https://central.sonatype.com/api/v1/publisher/status?id=$DEPLOYMENT_ID")
+            STATE=$(echo "$STATUS_RESPONSE" | jq -r '.deploymentState')
+            echo "Central deployment state: $STATE (check $attempt/180)"
+
+            case "$STATE" in
+              PUBLISHED)
+                echo "Central deployment published successfully."
+                exit 0
+                ;;
+              FAILED)
+                echo "$STATUS_RESPONSE" | jq .
+                exit 1
+                ;;
+              PENDING|VALIDATING|VALIDATED|PUBLISHING)
+                ;;
+              *)
+                echo "Unexpected Central deployment response: $STATUS_RESPONSE"
+                exit 1
+                ;;
+            esac
+
+            sleep 10
+          done
+
+          echo "Timed out waiting for Central deployment $DEPLOYMENT_ID to publish."
+          exit 1
         env:
           CENTRAL_TOKEN: ${{ secrets.CENTRAL_TOKEN }}
+
+  create-github-release:
+    if: github.event_name == 'push'
+    needs: publish
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v5
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            echo "GitHub Release $GITHUB_REF_NAME already exists; leaving it unchanged."
+          else
+            gh release create "$GITHUB_REF_NAME" --verify-tag --generate-notes --title "$GITHUB_REF_NAME"
+          fi
