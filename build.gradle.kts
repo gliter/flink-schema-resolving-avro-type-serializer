@@ -14,8 +14,9 @@ group = providers.gradleProperty("group").get()
 
 val javaVersion = providers.gradleProperty("javaVersion").map(String::toInt).getOrElse(17)
 val flinkVersion = providers.gradleProperty("flinkVersion").getOrElse("2.3.0")
-val libraryVersion = providers.gradleProperty("libraryVersion").getOrElse("0.1.0")
-version = "$libraryVersion-$flinkVersion"
+val libraryVersion = providers.gradleProperty("libraryVersion").getOrElse("1.0.0")
+val releaseBuild = providers.gradleProperty("releaseBuild").map { it.toBoolean() }.getOrElse(false)
+version = "$libraryVersion-$flinkVersion" + if (releaseBuild) "" else "-SNAPSHOT"
 
 java {
     toolchain.languageVersion = JavaLanguageVersion.of(javaVersion)

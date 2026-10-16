@@ -238,12 +238,12 @@ GitHub Actions runs the test matrix for Java 17 and 21 with Flink 2.2.1 and 2.3.
 
 ## Publishing
 
-The Maven Central coordinates are `io.github.gliter:schema-resolving-avro-serializer`. Versions use the format `major.minor.patch-<Flink version>`, which makes the target Flink line visible in the published version. The default build version is `0.1.0-2.3.0`. Set the library version part with `-PlibraryVersion=1.2.3`.
+The Maven Central coordinates are `io.github.gliter:schema-resolving-avro-serializer`. Published versions use the format `major.minor.patch-<Flink version>`, which makes the target Flink line visible in the version. Local builds use the same format with a `-SNAPSHOT` suffix. The default local build version is `1.0.0-2.3.0-SNAPSHOT`. Set the local library version part with `-PlibraryVersion=1.2.3`.
 
-The release workflow creates a GitHub Release with generated notes when you push a library-version tag, such as `v1.2.3`. Before release, configure the repository secrets `SIGNING_KEY`, `SIGNING_PASSWORD`, and `CENTRAL_TOKEN`; the Central token must be the base64 form of `username:password`. The `io.github.gliter` namespace must be verified in Sonatype Central. The workflow checks the tag against `libraryVersion`, then uploads a separate artifact for each supported Flink version (for example, `1.2.3-2.2.1` and `1.2.3-2.3.0`). It creates the GitHub Release after Central accepts both uploads; Central validation and publication continue asynchronously, so the artifacts may not yet be available in Maven Central when the GitHub Release appears.
+The release workflow takes the library version from a tag such as `v1.2.3`; it does not compare the tag with the local development version. It builds and uploads a separate non-SNAPSHOT artifact for each supported Flink version (for example, `1.2.3-2.2.1` and `1.2.3-2.3.0`). It creates a GitHub Release with generated notes after Central accepts both uploads; Central validation and publication continue asynchronously, so the artifacts may not yet be available in Maven Central when the GitHub Release appears. Before release, configure the repository secrets `SIGNING_KEY`, `SIGNING_PASSWORD`, and `CENTRAL_TOKEN`; the Central token must be the base64 form of `username:password`. The `io.github.gliter` namespace must be verified in Sonatype Central.
 
-To create the signed bundle locally, provide the Gradle properties `signingKey` and `signingPassword`, or their matching environment variables. Then run:
+To create a signed release bundle locally, provide the Gradle properties `signingKey` and `signingPassword`, or their matching environment variables. Set `releaseBuild=true` to omit `-SNAPSHOT` from the version:
 
 ```shell
-./gradlew centralBundle
+./gradlew centralBundle -PlibraryVersion=1.2.3 -PreleaseBuild=true -PflinkVersion=2.3.0
 ```
