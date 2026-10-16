@@ -13,6 +13,11 @@ jobs:
   publish:
     runs-on: ubuntu-latest
     environment: release
+    strategy:
+      fail-fast: false
+      matrix:
+        flink-version: ["2.2.1", "2.3.0"]
+    name: Publish Flink ${{ matrix.flink-version }}
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-java@v5
@@ -20,13 +25,13 @@ jobs:
           distribution: temurin
           java-version: "17"
       - uses: gradle/actions/setup-gradle@v4
-      - name: Verify tag matches the computed artifact version
+      - name: Verify tag matches the library version
         if: github.event_name == 'push'
         run: |
-          VERSION=$(./gradlew -q properties | awk -F': ' '/^version:/{print $2}')
-          test "${GITHUB_REF_NAME}" = "v${VERSION}"
+          LIBRARY_VERSION=$(awk -F= '$1 == "libraryVersion" {print $2}' gradle.properties)
+          test "${GITHUB_REF_NAME}" = "v${LIBRARY_VERSION}"
       - name: Build, test, sign, and bundle
-        run: ./gradlew check centralBundle --stacktrace
+        run: ./gradlew check centralBundle -PflinkVersion=${{ matrix.flink-version }} --stacktrace
         env:
           SIGNING_KEY: ${{ secrets.SIGNING_KEY }}
           SIGNING_PASSWORD: ${{ secrets.SIGNING_PASSWORD }}
@@ -35,6 +40,6 @@ jobs:
           curl --fail-with-body --request POST \
             --header "Authorization: Bearer $CENTRAL_TOKEN" \
             --form bundle=@build/distributions/central-bundle.zip \
-            "https://central.sonatype.com/api/v1/publisher/upload?name=${GITHUB_REF_NAME:-manual}&publishingType=AUTOMATIC"
+            "https://central.sonatype.com/api/v1/publisher/upload?name=${GITHUB_REF_NAME:-manual}-flink-${{ matrix.flink-version }}&publishingType=AUTOMATIC"
         env:
           CENTRAL_TOKEN: ${{ secrets.CENTRAL_TOKEN }}

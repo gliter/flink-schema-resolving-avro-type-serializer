@@ -45,4 +45,4 @@ Keep OS detection and platform-specific test temporary paths in Gradle's `Test` 
 
 ## Publishing
 
-Coordinates are `io.github.gliter:schema-resolving-avro-serializer`, with version format `major.minor.patch-<Flink version>`. Use `centralBundle` to create the signed archive consumed by the tag-driven release workflow. Do not publish a tag unless its name is `v<project version>`.
+Coordinates are `io.github.gliter:schema-resolving-avro-serializer`, with artifact versions in the format `major.minor.patch-<Flink version>`. Use `centralBundle` to create the signed archive consumed by the tag-driven release workflow. Release tags contain only the library version, such as `v1.2.3`; the workflow publishes one artifact for each supported Flink version.
