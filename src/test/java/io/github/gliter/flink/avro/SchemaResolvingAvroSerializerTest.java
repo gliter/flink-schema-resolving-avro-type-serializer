@@ -28,6 +28,7 @@ import java.util.stream.Stream;
 import javax.tools.JavaCompiler;
 import javax.tools.ToolProvider;
 
+import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
@@ -54,6 +55,98 @@ class SchemaResolvingAvroSerializerTest {
              "fields":[{"name":"name","type":"string"},
                        {"name":"tier","type":"string","default":"standard"}]}
             """);
+    private static final Schema V2_FIELD_INSERTED_FIRST = new Schema.Parser().parse("""
+            {"type":"record","name":"Customer","namespace":"example",
+             "fields":[{"name":"tier","type":"string","default":"standard"},
+                       {"name":"name","type":"string"}]}
+            """);
+    private static final Schema INCOMPATIBLE_READER = new Schema.Parser().parse("""
+            {"type":"record","name":"Customer","namespace":"example",
+             "fields":[{"name":"name","type":"int"}]}
+            """);
+    private static final Schema TWO_BOOLEANS = new Schema.Parser().parse("""
+            {"type":"record","name":"Flags","namespace":"example",
+             "fields":[{"name":"a","type":"boolean"},{"name":"b","type":"boolean"}]}
+            """);
+    private static final Schema NUMERIC_FIRST = new Schema.Parser().parse("""
+            {"type":"record","name":"Reading","namespace":"example",
+             "fields":[{"name":"timestamp","type":"long"},{"name":"value","type":"double"}]}
+            """);
+    private static final Schema SHORT_NUMERIC_FIRST = new Schema.Parser().parse("""
+            {"type":"record","name":"Counter","namespace":"example",
+             "fields":[{"name":"count","type":"int"}]}
+            """);
+
+    @Test
+    void fullRewriteResetsSchemaHistoryAndLazyRestoreKeepsIt() {
+        Schema first = new Schema.Parser().parse("{\"type\":\"record\",\"name\":\"History\",\"fields\":[{\"name\":\"x\",\"type\":\"string\"}]}");
+        Schema second = new Schema.Parser().parse("{\"type\":\"record\",\"name\":\"History\",\"fields\":[]}");
+        Schema third = new Schema.Parser().parse("{\"type\":\"record\",\"name\":\"History\",\"fields\":[{\"name\":\"x\",\"type\":\"int\",\"default\":0}]}");
+        var config = Map.<String, Object>of("schema.registry.url", "mock://history-reset");
+        var one = SchemaResolvingAvroSerializer.forGeneric("history", first, config);
+        var two = SchemaResolvingAvroSerializer.forGeneric("history", second, config);
+        two.snapshotConfiguration().resolveSchemaCompatibility(one.snapshotConfiguration());
+        var mixed = two.snapshotConfiguration();
+        assertEquals(2, two.recordedSchemas().size());
+        var three = SchemaResolvingAvroSerializer.forGeneric("history", third, config);
+        assertTrue(three.snapshotConfiguration().resolveSchemaCompatibility(mixed).isIncompatible());
+        var rewrite = SchemaResolvingAvroSerializer.forGeneric("history", second,
+                Map.of("schema.registry.url", "mock://history-reset", "force.migration.nonce", 1,
+                        "allow.full.migration", true));
+        assertTrue(rewrite.snapshotConfiguration().resolveSchemaCompatibility(mixed).isCompatibleAfterMigration());
+        var rewritten = rewrite.snapshotConfiguration();
+        assertEquals(1, rewrite.recordedSchemas().size());
+        assertTrue(three.snapshotConfiguration().resolveSchemaCompatibility(rewritten).isCompatibleAsIs());
+    }
+
+    @Test
+    void fullMigrationRequiresExplicitPermission() {
+        var previous = SchemaResolvingAvroSerializer.forGeneric("migration-gate", V1,
+                Map.of("schema.registry.url", "mock://migration-gate")).snapshotConfiguration();
+        for (Map<String, Object> request : java.util.List.of(
+                Map.<String, Object>of("force.migration.nonce", 1),
+                Map.<String, Object>of("frame.magic", "AB"))) {
+            var config = new java.util.HashMap<String, Object>(request);
+            config.put("schema.registry.url", "mock://migration-gate");
+            var denied = SchemaResolvingAvroSerializer.forGeneric("migration-gate", V1, config);
+            assertTrue(denied.snapshotConfiguration().resolveSchemaCompatibility(previous).isIncompatible());
+            config.put("allow.full.migration", true);
+            var allowed = SchemaResolvingAvroSerializer.forGeneric("migration-gate", V1, config);
+            assertTrue(allowed.snapshotConfiguration().resolveSchemaCompatibility(previous).isCompatibleAfterMigration());
+        }
+        var legacy = new AvroSerializer<>(GenericRecord.class, NUMERIC_FIRST).snapshotConfiguration();
+        var deniedLegacy = SchemaResolvingAvroSerializer.forGeneric("migration-gate", NUMERIC_FIRST,
+                Map.of("schema.registry.url", "mock://migration-gate-legacy"));
+        assertTrue(deniedLegacy.snapshotConfiguration().resolveSchemaCompatibility(legacy).isIncompatible());
+    }
+
+    @Test
+    void unsafeLegacyMagicRequiresExplicitPolicy() {
+        var legacy = new AvroSerializer<>(GenericRecord.class, NUMERIC_FIRST).snapshotConfiguration();
+        var defaults = SchemaResolvingAvroSerializer.forGeneric("policy", NUMERIC_FIRST,
+                Map.of("schema.registry.url", "mock://unsafe-policy"));
+        assertTrue(defaults.snapshotConfiguration().resolveSchemaCompatibility(legacy).isIncompatible());
+        var unsafe = SchemaResolvingAvroSerializer.forGeneric("policy", NUMERIC_FIRST,
+                Map.of("schema.registry.url", "mock://unsafe-policy", "use.unsafe.magic", true));
+        assertTrue(unsafe.snapshotConfiguration().resolveSchemaCompatibility(legacy)
+                .isCompatibleWithReconfiguredSerializer());
+        var migrate = SchemaResolvingAvroSerializer.forGeneric("policy", NUMERIC_FIRST,
+                Map.of("schema.registry.url", "mock://unsafe-policy", "allow.full.migration", true));
+        assertTrue(migrate.snapshotConfiguration().resolveSchemaCompatibility(legacy).isCompatibleAfterMigration());
+    }
+
+    @Test
+    void newStateStartsWithVersionWithoutMagic() throws Exception {
+        var serializer = SchemaResolvingAvroSerializer.forGeneric(
+                "customer-state", V1, Map.of("schema.registry.url", "mock://empty-magic"));
+        GenericRecord record = new GenericData.Record(V1);
+        record.put("name", "Ada");
+        DataOutputSerializer output = new DataOutputSerializer(64);
+        serializer.serialize(record, output);
+        assertEquals(0, serializer.frameMagic().length);
+        assertEquals((byte) 1, output.getCopyOfBuffer()[0]);
+        assertEquals(record, serializer.deserialize(new DataInputDeserializer(output.getCopyOfBuffer())));
+    }
 
     @Test
     void recordKindSnapshotIdsAreExplicitAndRejectUnknownValues() {
@@ -102,7 +195,7 @@ class SchemaResolvingAvroSerializerTest {
         Map<String, Object> config = Map.of(
                 "schema.registry.url", "mock://forced-migration",
                 "auto.register.schemas", true,
-                "force.migration.nonce", 1);
+                "force.migration.nonce", 1, "allow.full.migration", true);
         SchemaResolvingAvroSerializer<GenericRecord> oldSerializer =
                 SchemaResolvingAvroSerializer.forGeneric("customer-state", V1, oldConfig);
         SchemaResolvingAvroSerializer<GenericRecord> currentSerializer =
@@ -145,7 +238,7 @@ class SchemaResolvingAvroSerializerTest {
         Map<String, Object> nextNonceConfig = Map.of(
                 "schema.registry.url", "mock://forced-migration",
                 "auto.register.schemas", true,
-                "force.migration.nonce", 2);
+                "force.migration.nonce", 2, "allow.full.migration", true);
         SchemaResolvingAvroSerializer<GenericRecord> nextNonceSerializer =
                 SchemaResolvingAvroSerializer.forGeneric("customer-state", V2, nextNonceConfig);
         assertTrue(nextNonceSerializer.snapshotConfiguration().resolveSchemaCompatibility(restoredSnapshot)
@@ -166,9 +259,9 @@ class SchemaResolvingAvroSerializerTest {
     }
 
     @Test
-    void forceMigrationNonceMustBeAnInt() {
-        assertThrows(IllegalArgumentException.class, () -> SchemaResolvingAvroSerializer.forGeneric(
-                "customer-state", V2, Map.of("force.migration.nonce", "1")));
+    void forceMigrationNonceMustFitAnIntFromEitherConfigSource() {
+        assertEquals(1, SchemaResolvingAvroSerializer.forGeneric(
+                "customer-state", V2, Map.of("force.migration.nonce", "1")).forceMigrationNonce());
         assertThrows(IllegalArgumentException.class, () -> SchemaResolvingAvroSerializer.forGeneric(
                 "customer-state", V2, Map.of("force.migration.nonce", 2_147_483_648L)));
     }
@@ -239,7 +332,8 @@ class SchemaResolvingAvroSerializerTest {
         oldAvroSerializer.serialize(oldRecord, oldBytes);
 
         SchemaResolvingAvroSerializer<GenericRecord> mixed = SchemaResolvingAvroSerializer
-                .forGeneric("customer-state", V2, config).withLegacyWriterSchema(V1);
+                .forGeneric("customer-state", V2, config)
+                .reconfigured(V1, new byte[] { (byte) 0xff });
         GenericRecord newRecord = new GenericData.Record(V2);
         newRecord.put("name", "confluent");
         newRecord.put("tier", "gold");
@@ -301,16 +395,121 @@ class SchemaResolvingAvroSerializerTest {
     }
 
     @Test
-    void copiesAndRoundTripsNull() throws Exception {
+    void readsLegacyValuesShorterThanTheFrameAndConsecutiveLegacyValues() throws Exception {
+        // Two booleans encode to exactly two bytes under Flink's Avro serializer.
+        GenericRecord flags = new GenericData.Record(TWO_BOOLEANS);
+        flags.put("a", true);
+        flags.put("b", false);
+        byte[] one = legacyBytes(TWO_BOOLEANS, flags);
+        assertEquals(2, one.length);
+        SchemaResolvingAvroSerializer<GenericRecord> serializer =
+                bridgedFromFlinkAvro(TWO_BOOLEANS, TWO_BOOLEANS, "mock://short-legacy");
+        assertArrayEquals(new byte[] { (byte) 0xff }, serializer.frameMagic());
+
+        assertEquals(true, serializer.deserialize(new DataInputDeserializer(one)).get("a"));
+
+        // ListState and heap snapshots place values back to back in one stream.
+        DataInputDeserializer input = new DataInputDeserializer(concat(one, one));
+        serializer.deserialize(input);
+        assertEquals(2, input.available());
+        serializer.deserialize(input);
+        assertEquals(0, input.available());
+    }
+
+    @Test
+    void copyOfLegacyValueKeepsFieldValuesWhenReaderInsertsAField() throws Exception {
+        GenericRecord record = new GenericData.Record(V1);
+        record.put("name", "legacy");
+        byte[] legacy = legacyBytes(V1, record);
+        SchemaResolvingAvroSerializer<GenericRecord> serializer =
+                bridgedFromFlinkAvro(V1, V2_FIELD_INSERTED_FIRST, "mock://copy-legacy");
+
+        DataOutputSerializer copied = new DataOutputSerializer(64);
+        serializer.copy(new DataInputDeserializer(legacy), copied);
+
+        assertEquals("legacy|standard", readNameAndTier(
+                serializer.deserialize(new DataInputDeserializer(copied.getCopyOfBuffer()))));
+    }
+
+    @Test
+    void numericFirstLegacySchemaUsesTheLongMagicOrMigratesWhenValuesCanBeShort() throws Exception {
+        GenericRecord reading = new GenericData.Record(NUMERIC_FIRST);
+        reading.put("timestamp", -42L);
+        reading.put("value", 2.5d);
+        SchemaResolvingAvroSerializer<GenericRecord> serializer =
+                bridgedFromFlinkAvro(NUMERIC_FIRST, NUMERIC_FIRST, "mock://numeric-legacy");
+        assertArrayEquals(SchemaResolvingAvroSerializer.HEURISTIC_FRAME_MAGIC, serializer.frameMagic());
+        assertEquals(-42L, serializer.deserialize(new DataInputDeserializer(legacyBytes(NUMERIC_FIRST, reading)))
+                .get("timestamp"));
+
+        SchemaResolvingAvroSerializer<GenericRecord> counter = SchemaResolvingAvroSerializer.forGeneric(
+                "customer-state", SHORT_NUMERIC_FIRST,
+                Map.of("schema.registry.url", "mock://short-numeric-legacy", "auto.register.schemas", true,
+                        "allow.full.migration", true));
+        assertTrue(counter.snapshotConfiguration().resolveSchemaCompatibility(
+                new AvroSerializer<>(GenericRecord.class, SHORT_NUMERIC_FIRST).snapshotConfiguration())
+                .isCompatibleAfterMigration());
+    }
+
+    @Test
+    void explicitFrameMagicIsHonouredAndChangingItForcesMigration() throws Exception {
+        Map<String, Object> explicit = Map.of(
+                "schema.registry.url", "mock://explicit-magic", "auto.register.schemas", true, "frame.magic", "AB");
+        SchemaResolvingAvroSerializer<GenericRecord> writer = SchemaResolvingAvroSerializer.forGeneric("customer-state", V1, explicit);
+        GenericRecord record = new GenericData.Record(V1);
+        record.put("name", "Ada");
+        DataOutputSerializer output = new DataOutputSerializer(64);
+        writer.serialize(record, output);
+        assertEquals((byte) 0xab, output.getCopyOfBuffer()[0]);
+        SchemaResolvingAvroSerializerSnapshot<GenericRecord> snapshot =
+                (SchemaResolvingAvroSerializerSnapshot<GenericRecord>) writer.snapshotConfiguration();
+
+        SchemaResolvingAvroSerializer<GenericRecord> changedMagic = SchemaResolvingAvroSerializer.forGeneric("customer-state", V1, Map.of(
+                "schema.registry.url", "mock://explicit-magic", "auto.register.schemas", true, "frame.magic", "CD", "allow.full.migration", true));
+        assertTrue(changedMagic.snapshotConfiguration().resolveSchemaCompatibility(snapshot).isCompatibleAfterMigration());
+
+        SchemaResolvingAvroSerializer<GenericRecord> unconfigured = SchemaResolvingAvroSerializer.forGeneric("customer-state", V1,
+                Map.of("schema.registry.url", "mock://explicit-magic", "auto.register.schemas", true));
+        TypeSerializerSchemaCompatibility<GenericRecord> carried = unconfigured.snapshotConfiguration().resolveSchemaCompatibility(snapshot);
+        assertTrue(carried.isCompatibleWithReconfiguredSerializer());
+        assertEquals("Ada", carried.getReconfiguredSerializer()
+                .deserialize(new DataInputDeserializer(output.getCopyOfBuffer())).get("name").toString());
+
+        assertThrows(IllegalArgumentException.class, () -> SchemaResolvingAvroSerializer.forGeneric(
+                "customer-state", V1, Map.of("frame.magic", "not-hex")));
+    }
+
+    @Test
+    void rejectsReaderSchemaThatCannotReadKnownWriterSchemasUnlessVerificationIsDisabled() throws Exception {
+        Map<String, Object> config = Map.of("schema.registry.url", "mock://verify", "auto.register.schemas", true);
+        SchemaResolvingAvroSerializer<GenericRecord> v1 = SchemaResolvingAvroSerializer.forGeneric("customer-state", V1, config);
+        GenericRecord record = new GenericData.Record(V1);
+        record.put("name", "Ada");
+        v1.serialize(record, new DataOutputSerializer(64));
+
+        SchemaResolvingAvroSerializer<GenericRecord> incompatibleReader =
+                SchemaResolvingAvroSerializer.forGeneric("customer-state", INCOMPATIBLE_READER, config);
+        assertTrue(incompatibleReader.snapshotConfiguration().resolveSchemaCompatibility(v1.snapshotConfiguration())
+                .isIncompatible());
+        assertTrue(incompatibleReader.snapshotConfiguration().resolveSchemaCompatibility(
+                new AvroSerializer<>(GenericRecord.class, V1).snapshotConfiguration()).isIncompatible());
+
+        SchemaResolvingAvroSerializer<GenericRecord> unverified = SchemaResolvingAvroSerializer.forGeneric(
+                "customer-state", INCOMPATIBLE_READER, Map.of("schema.registry.url", "mock://verify",
+                        "auto.register.schemas", true, "verify.schema.compatibility", false));
+        assertTrue(unverified.snapshotConfiguration().resolveSchemaCompatibility(v1.snapshotConfiguration())
+                .isCompatibleAsIs());
+    }
+
+    @Test
+    void copiesRecordsAndRejectsNullLikeFlinkAvroSerializer() {
         Map<String, Object> schemaRegistryConfig = Map.of("schema.registry.url", "mock://copy", "auto.register.schemas", true);
         SchemaResolvingAvroSerializer<GenericRecord> serializer = SchemaResolvingAvroSerializer.forGeneric("customer-state", V1, schemaRegistryConfig);
         GenericRecord original = new GenericData.Record(V1);
         original.put("name", "Lin");
         assertEquals(original, serializer.copy(original));
 
-        DataOutputSerializer output = new DataOutputSerializer(16);
-        serializer.serialize(null, output);
-        assertNull(serializer.deserialize(new DataInputDeserializer(output.getCopyOfBuffer())));
+        assertThrows(NullPointerException.class, () -> serializer.serialize(null, new DataOutputSerializer(16)));
     }
 
     @Test
@@ -368,7 +567,8 @@ class SchemaResolvingAvroSerializerTest {
                 "customer-state", V2, Map.of("schema.registry.url", "mock://two", "auto.register.schemas", true));
 
         assertTrue(changedSubject.snapshotConfiguration().resolveSchemaCompatibility(oldSerializer.snapshotConfiguration()).isCompatibleAsIs());
-        assertTrue(changedRegistry.snapshotConfiguration().resolveSchemaCompatibility(oldSerializer.snapshotConfiguration()).isCompatibleAsIs());
+        assertThrows(IllegalStateException.class, () -> changedRegistry.snapshotConfiguration()
+                .resolveSchemaCompatibility(oldSerializer.snapshotConfiguration()));
     }
 
     @Test
@@ -470,8 +670,31 @@ class SchemaResolvingAvroSerializerTest {
 
     private static int schemaIdFromFramedValue(byte[] bytes) throws java.io.IOException {
         DataInputDeserializer input = new DataInputDeserializer(bytes);
-        input.skipBytesToRead(SchemaResolvingAvroSerializer.WIRE_MAGIC.length + 1 + 1 + Integer.BYTES + 1);
-        return input.readInt();
+        input.skipBytesToRead(SchemaResolvingAvroSerializer.DEFAULT_FRAME_MAGIC.length + 1);
+        return SchemaResolvingAvroSerializer.readVarInt(input);
+    }
+
+    private static byte[] legacyBytes(Schema schema, GenericRecord record) throws java.io.IOException {
+        DataOutputSerializer output = new DataOutputSerializer(64);
+        new AvroSerializer<>(GenericRecord.class, schema).serialize(record, output);
+        return output.getCopyOfBuffer();
+    }
+
+    @SuppressWarnings("unchecked")
+    private static SchemaResolvingAvroSerializer<GenericRecord> bridgedFromFlinkAvro(
+            Schema legacySchema, Schema readerSchema, String registryUrl) {
+        SchemaResolvingAvroSerializer<GenericRecord> current = SchemaResolvingAvroSerializer.forGeneric(
+                "customer-state", readerSchema, Map.of("schema.registry.url", registryUrl, "auto.register.schemas", true, "use.unsafe.magic", true));
+        TypeSerializerSchemaCompatibility<GenericRecord> compatibility = current.snapshotConfiguration()
+                .resolveSchemaCompatibility(new AvroSerializer<>(GenericRecord.class, legacySchema).snapshotConfiguration());
+        assertTrue(compatibility.isCompatibleWithReconfiguredSerializer());
+        return (SchemaResolvingAvroSerializer<GenericRecord>) compatibility.getReconfiguredSerializer();
+    }
+
+    private static byte[] concat(byte[] first, byte[] second) {
+        byte[] both = java.util.Arrays.copyOf(first, first.length + second.length);
+        System.arraycopy(second, 0, both, first.length, second.length);
+        return both;
     }
 
     private static Schema schemaFromId(String url, int schemaId) throws Exception {

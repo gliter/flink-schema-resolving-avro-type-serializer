@@ -151,6 +151,10 @@ class SchemaRegistryAuthenticationTest {
                     && path.contains("/versions")) {
                 exchange.getRequestBody().readAllBytes();
                 respond(exchange, 200, "{\"id\":1}");
+            } else if ("POST".equals(exchange.getRequestMethod()) && path.startsWith("/subjects/")) {
+                exchange.getRequestBody().readAllBytes();
+                respond(exchange, 200, "{\"id\":1,\"version\":1,\"subject\":\"customer-state\",\"schema\":"
+                        + jsonString(schema.toString()) + "}");
             } else if ("GET".equals(exchange.getRequestMethod()) && path.startsWith("/schemas/ids/1")) {
                 respond(exchange, 200, "{\"schema\":" + jsonString(schema.toString())
                         + ",\"schemaType\":\"AVRO\"}");

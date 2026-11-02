@@ -3,91 +3,112 @@ package io.github.gliter.flink.avro;
 import io.confluent.kafka.schemaregistry.ParsedSchema;
 import io.confluent.kafka.schemaregistry.avro.AvroSchema;
 import io.confluent.kafka.schemaregistry.avro.AvroSchemaProvider;
+import io.confluent.kafka.schemaregistry.client.SchemaMetadata;
 import io.confluent.kafka.schemaregistry.client.SchemaRegistryClient;
 import io.confluent.kafka.schemaregistry.client.SchemaRegistryClientFactory;
 import io.confluent.kafka.schemaregistry.client.rest.exceptions.RestClientException;
 import org.apache.avro.Schema;
+import org.apache.avro.SchemaCompatibility;
+import org.apache.avro.SchemaCompatibility.SchemaCompatibilityType;
+import org.apache.avro.SchemaCompatibility.SchemaPairCompatibility;
 import org.apache.avro.generic.GenericData;
 import org.apache.avro.generic.GenericDatumReader;
 import org.apache.avro.generic.GenericDatumWriter;
 import org.apache.avro.generic.GenericRecord;
-import org.apache.avro.io.BinaryEncoder;
+import org.apache.avro.generic.IndexedRecord;
 import org.apache.avro.io.BinaryDecoder;
+import org.apache.avro.io.BinaryEncoder;
+import org.apache.avro.io.DatumReader;
+import org.apache.avro.io.DatumWriter;
 import org.apache.avro.io.DecoderFactory;
 import org.apache.avro.io.EncoderFactory;
 import org.apache.avro.specific.SpecificData;
 import org.apache.avro.specific.SpecificDatumReader;
 import org.apache.avro.specific.SpecificDatumWriter;
 import org.apache.avro.specific.SpecificRecord;
-import org.apache.avro.generic.IndexedRecord;
 import org.apache.flink.api.common.typeutils.TypeSerializer;
 import org.apache.flink.api.common.typeutils.TypeSerializerSnapshot;
 import org.apache.flink.configuration.GlobalConfiguration;
 import org.apache.flink.core.memory.DataInputView;
+import org.apache.flink.api.java.typeutils.runtime.DataInputViewStream;
+import org.apache.flink.api.java.typeutils.runtime.DataOutputViewStream;
 import org.apache.flink.core.memory.DataInputViewStreamWrapper;
 import org.apache.flink.core.memory.DataOutputView;
 import org.apache.flink.formats.avro.utils.DataInputDecoder;
-import org.apache.flink.formats.avro.utils.DataOutputEncoder;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
+import java.io.DataInput;
+import java.io.EOFException;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.Serializable;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.HashMap;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 
 /**
- * A Flink state serializer that stores Confluent-framed Avro bytes.
+ * A Flink state serializer that stores Avro bytes framed with the Schema Registry id of their writer schema.
  *
- * <p>Each non-null value retains its Confluent schema id. This allows a current reader schema to
- * resolve historical bytes without rewriting otherwise stable state bytes.</p>
+ * <p>Each value keeps its writer schema id, so the current reader schema resolves historical bytes without
+ * rewriting otherwise stable state.</p>
  *
  * @param <T> the Avro record representation
  */
 public final class SchemaResolvingAvroSerializer<T extends IndexedRecord> extends TypeSerializer<T> {
-    private static final long serialVersionUID = 1L;
+    private static final long serialVersionUID = 2L;
     private static final Logger LOG = LoggerFactory.getLogger(SchemaResolvingAvroSerializer.class);
-    static final byte[] WIRE_MAGIC = new byte[] { 'S', 'R', 'A', 'V', 'R', 'O' };
+    /** Frame magic for state that never held raw Flink Avro values. */
+    static final byte[] DEFAULT_FRAME_MAGIC = {};
+    /** Longer frame magic for legacy writer schemas whose values may start with any byte. */
+    static final byte[] HEURISTIC_FRAME_MAGIC = { 'S', 'R', 'A', 'V', 'R', 'O' };
     static final byte WIRE_VERSION = 1;
-    private static final int WIRE_MAGIC_WORD = ((WIRE_MAGIC[0] & 0xff) << 24)
-            | ((WIRE_MAGIC[1] & 0xff) << 16) | ((WIRE_MAGIC[2] & 0xff) << 8) | (WIRE_MAGIC[3] & 0xff);
-    private static final int WIRE_MAGIC_SUFFIX_WORD = ((WIRE_MAGIC[4] & 0xff) << 8) | (WIRE_MAGIC[5] & 0xff);
+    static final String ALLOW_FULL_MIGRATION = "allow.full.migration";
+    static final String USE_UNSAFE_MAGIC = "use.unsafe.magic";
+    static final String FRAME_MAGIC = "frame.magic";
+    static final String VERIFY_SCHEMA_COMPATIBILITY = "verify.schema.compatibility";
+    private static final String SCHEMA_REGISTRY_URL = "schema.registry.url";
     private static final String AUTO_REGISTER_SCHEMAS = "auto.register.schemas";
     private static final String NORMALIZE_SCHEMAS = "normalize.schemas";
+    private static final String MAX_SCHEMAS_PER_SUBJECT = "max.schemas.per.subject";
     private static final String FORCE_MIGRATION_NONCE = "force.migration.nonce";
     private static final String FLINK_CONFIG_PREFIX = "schema.resolving.avro.";
     private static final String SECRET_CONFIG_PREFIX = FLINK_CONFIG_PREFIX + "secret.";
     private static final int SCHEMA_REGISTRY_CACHE_CAPACITY = 1000;
+    private static final int SUBJECT_NOT_FOUND_ERROR_CODE = 40401;
+    private static final int MAX_FRAME_MAGIC_BYTES = 16;
     private final String subject;
     private final AvroRecordKind recordKind;
     private final Class<T> specificClass;
     private final Schema readerSchema;
     private final Map<String, Object> serializerConfig;
     private final Schema legacyWriterSchema;
+    private final byte[] frameMagic;
+    private boolean legacyValueCanBeShorterThanMagic;
     private final boolean readOnly;
     private final Integer forceMigrationNonce;
     private Integer completedMigrationNonce;
     private boolean forceMigrationPending;
 
+    private boolean schemaHistoryInitialized;
+    private List<SchemaInfo> recordedSchemas = List.of();
     private transient SchemaRegistryClient schemaRegistryClient;
-
-    private SchemaResolvingAvroSerializer(
-            String subject,
-            AvroRecordKind recordKind,
-            Class<T> specificClass,
-            Schema readerSchema,
-            Map<String, ?> serializerConfig,
-            Schema legacyWriterSchema) {
-        this(subject, recordKind, specificClass, readerSchema, serializerConfig, legacyWriterSchema, false);
-    }
+    private transient Map<Integer, DatumReader<T>> readersBySchemaId;
+    private transient DatumReader<T> legacyReader;
+    private transient Map<Schema, DatumWriter<T>> writersBySchema;
+    private transient Map<Schema, Integer> schemaIdsBySchema;
+    private transient DataInputDecoder legacyDecoder;
+    private transient BinaryDecoder binaryDecoder;
+    private transient BinaryEncoder binaryEncoder;
 
     private SchemaResolvingAvroSerializer(
             String subject,
@@ -96,23 +117,29 @@ public final class SchemaResolvingAvroSerializer<T extends IndexedRecord> extend
             Schema readerSchema,
             Map<String, ?> serializerConfig,
             Schema legacyWriterSchema,
+            byte[] frameMagic,
             boolean readOnly) {
         this.subject = readOnly ? null : requireNonBlank(subject, "subject");
         this.recordKind = Objects.requireNonNull(recordKind, "recordKind");
         this.specificClass = specificClass;
         this.readerSchema = readerSchema;
         this.serializerConfig = normalizeConfig(serializerConfig);
-        this.forceMigrationNonce = integerNonceConfig(this.serializerConfig, FORCE_MIGRATION_NONCE);
+        this.forceMigrationNonce = parseNonce(this.serializerConfig.get(FORCE_MIGRATION_NONCE));
         this.completedMigrationNonce = forceMigrationNonce;
         this.legacyWriterSchema = legacyWriterSchema;
+        byte[] configuredMagic = configuredFrameMagic(this.serializerConfig);
+        this.frameMagic = frameMagic != null ? frameMagic.clone()
+                : configuredMagic != null ? configuredMagic : DEFAULT_FRAME_MAGIC;
         this.readOnly = readOnly;
     }
 
     static <T extends IndexedRecord> SchemaResolvingAvroSerializer<T> restoredReader(
-            AvroRecordKind kind, Class<T> specificClass, Schema legacyWriterSchema) {
+            AvroRecordKind kind, Class<T> specificClass, Schema legacyWriterSchema, byte[] frameMagic, boolean canBeShorter) {
         Schema readerSchema = specificClass == null ? null : instantiate(specificClass).getSchema();
-        return new SchemaResolvingAvroSerializer<>(null, kind, specificClass, readerSchema, Map.of(),
-                legacyWriterSchema, true);
+        SchemaResolvingAvroSerializer<T> reader = new SchemaResolvingAvroSerializer<>(null, kind, specificClass, readerSchema, Map.of(),
+                legacyWriterSchema, frameMagic, true);
+        reader.legacyValueCanBeShorterThanMagic = canBeShorter;
+        return reader;
     }
 
     /** Creates a serializer for a generated Avro specific record using the literal Registry subject. */
@@ -121,7 +148,7 @@ public final class SchemaResolvingAvroSerializer<T extends IndexedRecord> extend
         Objects.requireNonNull(recordClass, "recordClass");
         T instance = instantiate(recordClass);
         return new SchemaResolvingAvroSerializer<>(subject, AvroRecordKind.SPECIFIC, recordClass,
-                instance.getSchema(), serializerConfig, null);
+                instance.getSchema(), serializerConfig, null, null, false);
     }
 
     /** Creates a serializer for generic Avro records, projected to {@code readerSchema} on read. */
@@ -129,12 +156,21 @@ public final class SchemaResolvingAvroSerializer<T extends IndexedRecord> extend
             String subject, Schema readerSchema, Map<String, ?> serializerConfig) {
         Objects.requireNonNull(readerSchema, "readerSchema");
         return new SchemaResolvingAvroSerializer<>(subject, AvroRecordKind.GENERIC, null,
-                readerSchema, serializerConfig, null);
+                readerSchema, serializerConfig, null, null, false);
     }
 
-    SchemaResolvingAvroSerializer<T> withLegacyWriterSchema(Schema schema) {
+    /** A copy that reads raw values of {@code legacySchema} and frames new values with {@code magic}. */
+    SchemaResolvingAvroSerializer<T> reconfigured(Schema legacySchema, byte[] magic) {
+        return reconfigured(legacySchema, magic, legacySchema != null
+                && LegacyFrameAnalysis.canBeShorterThanMagic(legacySchema, magic.length));
+    }
+
+    SchemaResolvingAvroSerializer<T> reconfigured(Schema legacySchema, byte[] magic, boolean canBeShorter) {
         SchemaResolvingAvroSerializer<T> copy = new SchemaResolvingAvroSerializer<>(
-                subject, recordKind, specificClass, readerSchema, serializerConfig, schema);
+                subject, recordKind, specificClass, readerSchema, serializerConfig, legacySchema, magic, false);
+        copy.legacyValueCanBeShorterThanMagic = canBeShorter;
+        copy.schemaHistoryInitialized = schemaHistoryInitialized;
+        copy.recordedSchemas = recordedSchemas;
         copy.completedMigrationNonce = completedMigrationNonce;
         copy.forceMigrationPending = forceMigrationPending;
         return copy;
@@ -147,8 +183,11 @@ public final class SchemaResolvingAvroSerializer<T extends IndexedRecord> extend
 
     @Override
     public TypeSerializer<T> duplicate() {
-        SchemaResolvingAvroSerializer<T> copy = new SchemaResolvingAvroSerializer<>(
-                subject, recordKind, specificClass, readerSchema, serializerConfig, legacyWriterSchema, readOnly);
+        SchemaResolvingAvroSerializer<T> copy = new SchemaResolvingAvroSerializer<>(subject, recordKind,
+                specificClass, readerSchema, serializerConfig, legacyWriterSchema, frameMagic, readOnly);
+        copy.legacyValueCanBeShorterThanMagic = legacyValueCanBeShorterThanMagic;
+        copy.schemaHistoryInitialized = schemaHistoryInitialized;
+        copy.recordedSchemas = recordedSchemas;
         copy.completedMigrationNonce = completedMigrationNonce;
         copy.forceMigrationPending = forceMigrationPending;
         return copy;
@@ -172,10 +211,11 @@ public final class SchemaResolvingAvroSerializer<T extends IndexedRecord> extend
         if (from == null) {
             return null;
         }
+        // Deep copies walk fields by position, so the copy must use the record's own schema, not the reader's.
         @SuppressWarnings("unchecked")
         T copy = (T) (recordKind == AvroRecordKind.SPECIFIC
-                ? SpecificData.getForClass(specificClass).deepCopy(readerSchema, from)
-                : GenericData.get().deepCopy(readerSchema == null ? from.getSchema() : readerSchema, from));
+                ? SpecificData.getForClass(specificClass).deepCopy(from.getSchema(), from)
+                : GenericData.get().deepCopy(from.getSchema(), from));
         return copy;
     }
 
@@ -192,12 +232,8 @@ public final class SchemaResolvingAvroSerializer<T extends IndexedRecord> extend
     @Override
     public void serialize(T record, DataOutputView target) throws IOException {
         if (readOnly) throw new UnsupportedOperationException("Historical serializer is read-only");
-        target.write(WIRE_MAGIC);
-        target.writeByte(WIRE_VERSION);
-        if (record == null) {
-            target.writeBoolean(false);
-            return;
-        }
+        // Flink never hands a value serializer null: ValueState clears, ListState rejects, MapState flags it itself.
+        Objects.requireNonNull(record, "record");
         T valueToWrite = record;
         Schema writerSchema = record.getSchema();
         // GenericRecord restore reads with each historical writer schema. During forced migration,
@@ -207,14 +243,17 @@ public final class SchemaResolvingAvroSerializer<T extends IndexedRecord> extend
             valueToWrite = projectToReaderSchema(record);
             writerSchema = readerSchema;
         }
-        AvroSchema avroWriterSchema = new AvroSchema(writerSchema);
-        int schemaId = schemaIdForWrite(avroWriterSchema);
-        byte[] datum = encodeDatum(valueToWrite, writerSchema);
-        target.writeBoolean(true);
-        target.writeInt(datum.length + 1 + Integer.BYTES);
-        target.writeByte(0);
-        target.writeInt(schemaId);
-        target.write(datum);
+        if (!writerSchema.equals(readerSchema)) {
+            throw new IllegalArgumentException("Record schema must equal the configured runtime schema");
+        }
+        int schemaId = schemaIdForWrite(writerSchema);
+        target.write(frameMagic);
+        target.writeByte(WIRE_VERSION);
+        writeVarInt(target, schemaId);
+        // Framed datums use standard Avro binary encoding; only legacy values use Flink's DataOutputEncoder layout.
+        binaryEncoder = EncoderFactory.get().directBinaryEncoder(new DataOutputViewStream(target), binaryEncoder);
+        writerFor(writerSchema).write(valueToWrite, binaryEncoder);
+        binaryEncoder.flush();
     }
 
     @Override
@@ -224,77 +263,49 @@ public final class SchemaResolvingAvroSerializer<T extends IndexedRecord> extend
 
     @Override
     public T deserialize(T reuse, DataInputView source) throws IOException {
-        // Probe four bytes first so legacy raw-Avro values can be replayed without consuming them.
-        // A null framed value's full header is eight bytes, but an old Avro datum has no such header.
-        int firstWord = source.readInt();
-        if (firstWord != WIRE_MAGIC_WORD) return deserializeLegacy(source, firstWord, reuse);
-        int magicSuffix = source.readUnsignedShort();
-        if (magicSuffix != WIRE_MAGIC_SUFFIX_WORD) {
-            return deserializeLegacy(source, firstWord, magicSuffix, reuse);
+        if (!legacyValueCanBeShorterThanMagic && frameMagic.length > 0) {
+            byte[] probe = new byte[frameMagic.length];
+            source.readFully(probe);
+            if (!Arrays.equals(probe, frameMagic)) return deserializeLegacy(source, probe, reuse);
+        } else {
+            // Probe one byte at a time so a raw legacy datum loses at most the mismatching prefix, which is replayed.
+            for (int index = 0; index < frameMagic.length; index++) {
+                int next = source.readUnsignedByte();
+                if ((byte) next != frameMagic[index]) {
+                    byte[] consumed = Arrays.copyOf(frameMagic, index + 1);
+                    consumed[index] = (byte) next;
+                    return deserializeLegacy(source, consumed, reuse);
+                }
+            }
         }
         int version = source.readUnsignedByte();
-        if (version != WIRE_VERSION) throw new IOException("Unsupported Confluent Avro value format version: " + version);
-        if (!source.readBoolean()) return null;
-        int length = source.readInt();
-        if (length < 1 + Integer.BYTES) {
-            throw new IOException("Invalid Confluent payload length: " + length);
+        if (version != WIRE_VERSION) {
+            throw new IOException("Unsupported schema-resolving Avro value format version: " + version);
         }
-        byte[] bytes = new byte[length];
-        source.readFully(bytes);
-        if (bytes[0] != 0) {
-            throw new IOException("Unsupported Confluent Avro schema-ID wire-format version: " + (bytes[0] & 0xff));
-        }
-        int schemaId = ((bytes[1] & 0xff) << 24) | ((bytes[2] & 0xff) << 16)
-                | ((bytes[3] & 0xff) << 8) | (bytes[4] & 0xff);
+        int schemaId = readVarInt(source);
         if (schemaId <= 0) {
-            throw new IOException("Invalid Confluent Avro schema ID: " + schemaId);
+            throw new IOException("Invalid Schema Registry schema ID: " + schemaId);
         }
-        Schema writerSchema = writerSchemaForId(schemaId);
-        ByteArrayInputStream datumBytes = new ByteArrayInputStream(bytes, 1 + Integer.BYTES,
-                bytes.length - 1 - Integer.BYTES);
-        BinaryDecoder decoder = DecoderFactory.get().binaryDecoder(datumBytes, null);
-        return readDatum(writerSchema, reuse, decoder);
+        // The direct decoder reads exactly the datum and never buffers ahead into the next value.
+        binaryDecoder = DecoderFactory.get().directBinaryDecoder(new DataInputViewStream(source), binaryDecoder);
+        return readerForSchemaId(schemaId).read(reuse, binaryDecoder);
     }
 
     @Override
     public void copy(DataInputView source, DataOutputView target) throws IOException {
         if (readOnly) throw new UnsupportedOperationException("Historical serializer is read-only");
-        // Keep this four-byte probe aligned with deserialize(): a null value has no eight-byte header.
-        int firstWord = source.readInt();
-        if (firstWord != WIRE_MAGIC_WORD) {
-            T record = deserializeLegacy(source, firstWord, null);
-            writeLegacy(record, target);
-            return;
-        }
-        int magicSuffix = source.readUnsignedShort();
-        if (magicSuffix != WIRE_MAGIC_SUFFIX_WORD) {
-            T record = deserializeLegacy(source, firstWord, magicSuffix, null);
-            writeLegacy(record, target);
-            return;
-        }
-        int version = source.readUnsignedByte();
-        if (version != WIRE_VERSION) throw new IOException("Unsupported Confluent Avro value format version: " + version);
-        target.write(WIRE_MAGIC);
-        target.writeByte(WIRE_VERSION);
-        boolean present = source.readBoolean();
-        target.writeBoolean(present);
-        if (!present) {
-            return;
-        }
-        int length = source.readInt();
-        if (length < 1 + Integer.BYTES) {
-            throw new IOException("Invalid Confluent payload length: " + length);
-        }
-        target.writeInt(length);
-        byte[] bytes = new byte[length];
-        source.readFully(bytes);
-        target.write(bytes);
+        // The datum end is only known after decoding; re-encoding also frames legacy values with the current schema.
+        serialize(deserialize(source), target);
     }
 
     @Override
     public TypeSerializerSnapshot<T> snapshotConfiguration() {
+        if (!readOnly) initializeSchemaHistory();
         return new SchemaResolvingAvroSerializerSnapshot<>(this);
     }
+
+    boolean allowFullMigration() { return booleanConfig(ALLOW_FULL_MIGRATION, false); }
+    boolean useUnsafeMagic() { return booleanConfig(USE_UNSAFE_MAGIC, false); }
 
     String subject() { return subject; }
     AvroRecordKind recordKind() { return recordKind; }
@@ -302,12 +313,82 @@ public final class SchemaResolvingAvroSerializer<T extends IndexedRecord> extend
     Schema readerSchema() { return readerSchema; }
     Map<String, Object> serializerConfig() { return serializerConfig; }
     Schema legacyWriterSchema() { return legacyWriterSchema; }
+    boolean legacyValueCanBeShorterThanMagic() { return legacyValueCanBeShorterThanMagic; }
+    byte[] frameMagic() { return frameMagic.clone(); }
+    byte[] configuredFrameMagic() { return configuredFrameMagic(serializerConfig); }
     Integer forceMigrationNonce() {
         return migrationNonceFromConfig(serializerConfig, GlobalConfiguration.loadConfiguration().toMap());
     }
-    Integer completedMigrationNonce() { return completedMigrationNonce; }
+    /** Falls back to the requested nonce so a fresh job records a Flink-config nonce instead of null. */
+    Integer completedMigrationNonce() {
+        return completedMigrationNonce != null ? completedMigrationNonce : forceMigrationNonce();
+    }
     void recordMigrationNonce(Integer nonce) { completedMigrationNonce = nonce; }
     void markForceMigrationPending() { forceMigrationPending = true; }
+
+    List<SchemaInfo> recordedSchemas() { return List.copyOf(recordedSchemas); }
+
+    void recordedSchemas(List<SchemaInfo> schemas) { recordedSchemas = List.copyOf(schemas); schemaHistoryInitialized = false; }
+
+    private void initializeSchemaHistory() {
+        if (schemaHistoryInitialized) return;
+        try {
+            int id = schemaIdForWrite(readerSchema);
+            int version = schemaRegistryClient().getVersion(subject, new AvroSchema(readerSchema),
+                    booleanConfig(NORMALIZE_SCHEMAS, false));
+            var entries = new java.util.TreeSet<SchemaInfo>(java.util.Comparator.comparing(SchemaInfo::subject)
+                    .thenComparingInt(SchemaInfo::version).thenComparingInt(SchemaInfo::schemaId));
+            entries.addAll(recordedSchemas);
+            entries.add(new SchemaInfo(subject, version, id));
+            recordedSchemas = List.copyOf(entries);
+            schemaHistoryInitialized = true;
+            LOG.debug("Schemas potentially present in state: {}", recordedSchemas);
+            recordedSchemas.stream().map(SchemaInfo::subject).distinct().forEach(name ->
+                    LOG.info("Subject '{}' has {} schema versions potentially present in state", name,
+                            recordedSchemas.stream().filter(info -> info.subject().equals(name))
+                                    .map(SchemaInfo::version).distinct().count()));
+        } catch (IOException | RestClientException exception) {
+            throw new IllegalStateException("Could not initialize writer schema history", exception);
+        }
+    }
+
+    /** Returns null when the reader schema can read every known writer schema, else what it cannot read. */
+    String verifyReaderCompatibility(Schema previousLegacySchema, String previousSubject) {
+        if (!booleanConfig(VERIFY_SCHEMA_COMPATIBILITY, true)) {
+            LOG.warn("Schema compatibility verification is disabled; values the reader schema cannot resolve fail when read");
+            return null;
+        }
+        Map<String, Schema> writerSchemas = new LinkedHashMap<>();
+        if (previousLegacySchema != null) {
+            writerSchemas.put("legacy raw Avro writer schema '" + previousLegacySchema.getFullName() + "'", previousLegacySchema);
+        }
+        try {
+            SchemaRegistryClient client = schemaRegistryClient();
+            for (SchemaInfo info : recordedSchemas) {
+                ParsedSchema parsed = client.getSchemaById(info.schemaId());
+                if (!(parsed instanceof AvroSchema avro)) return "Recorded schema is not Avro: " + info;
+                writerSchemas.put(info.toString(), avro.rawSchema());
+            }
+
+        } catch (IOException | RestClientException exception) {
+            throw new IllegalStateException("Could not verify reader schema compatibility against Schema Registry", exception);
+        }
+        List<String> problems = new ArrayList<>();
+        for (Map.Entry<String, Schema> writer : writerSchemas.entrySet()) {
+            SchemaPairCompatibility result =
+                    SchemaCompatibility.checkReaderWriterCompatibility(readerSchema, writer.getValue());
+            if (result.getType() != SchemaCompatibilityType.COMPATIBLE) {
+                problems.add(writer.getKey() + ": " + result.getDescription());
+            }
+        }
+        if (!problems.isEmpty()) return String.join("; ", problems);
+        try {
+            schemaIdForWrite(readerSchema);
+        } catch (IOException exception) {
+            throw new IllegalStateException("Could not resolve reader schema in Schema Registry", exception);
+        }
+        return null;
+    }
 
     @Override
     public boolean equals(Object other) {
@@ -317,79 +398,115 @@ public final class SchemaResolvingAvroSerializer<T extends IndexedRecord> extend
         return Objects.equals(subject, that.subject)
                 && readOnly == that.readOnly
                 && recordKind == that.recordKind
-                && Objects.equals(readerSchema == null ? null : readerSchema.toString(),
-                        that.readerSchema == null ? null : that.readerSchema.toString())
+                && Objects.equals(schemaString(readerSchema), schemaString(that.readerSchema))
                 && serializerConfig.equals(that.serializerConfig)
-                && Objects.equals(schemaString(legacyWriterSchema), schemaString(that.legacyWriterSchema));
+                && Objects.equals(schemaString(legacyWriterSchema), schemaString(that.legacyWriterSchema))
+                && Arrays.equals(frameMagic, that.frameMagic);
     }
 
     @Override
     public int hashCode() {
         return Objects.hash(subject, readOnly, recordKind, schemaString(readerSchema), serializerConfig,
-                schemaString(legacyWriterSchema));
+                schemaString(legacyWriterSchema), Arrays.hashCode(frameMagic));
     }
 
     private static String schemaString(Schema schema) { return schema == null ? null : schema.toString(); }
 
-    private T deserializeLegacy(DataInputView source, int firstWord, T reuse) throws IOException {
-        return deserializeLegacy(source, firstWordPrefix(firstWord), reuse);
-    }
-
-    private T deserializeLegacy(DataInputView source, int firstWord, int secondWord, T reuse) throws IOException {
-        byte[] prefix = new byte[] {
-                (byte) (firstWord >>> 24), (byte) (firstWord >>> 16), (byte) (firstWord >>> 8), (byte) firstWord,
-                (byte) (secondWord >>> 8), (byte) secondWord
-        };
-        return deserializeLegacy(source, prefix, reuse);
-    }
-
-    private T deserializeLegacy(DataInputView source, byte[] prefix, T reuse) throws IOException {
+    private T deserializeLegacy(DataInputView source, byte[] consumedPrefix, T reuse) throws IOException {
         if (legacyWriterSchema == null) {
-            throw new IOException("Unframed legacy Avro state requires a writer schema from AvroSerializerSnapshot");
+            throw new IOException("Value does not start with frame magic " + LegacyFrameAnalysis.hex(frameMagic)
+                    + " and no legacy Avro writer schema is known");
         }
-        DataInputView replay = new DataInputViewStreamWrapper(new PrefixInputStream(prefix, source));
-        DataInputDecoder decoder = new DataInputDecoder();
-        decoder.setIn(replay);
-        return readDatum(legacyWriterSchema, reuse, decoder);
+        DataInput replay = new DataInputViewStreamWrapper(new PrefixInputStream(consumedPrefix, source));
+        if (legacyDecoder == null) legacyDecoder = new DataInputDecoder();
+        legacyDecoder.setIn(replay);
+        return legacyReader().read(reuse, legacyDecoder);
     }
 
-    private static byte[] firstWordPrefix(int firstWord) {
-        return new byte[] {
-                (byte) (firstWord >>> 24), (byte) (firstWord >>> 16),
-                (byte) (firstWord >>> 8), (byte) firstWord
-        };
+    private DatumReader<T> readerForSchemaId(int schemaId) throws IOException {
+        if (readersBySchemaId == null) readersBySchemaId = new HashMap<>();
+        DatumReader<T> reader = readersBySchemaId.get(schemaId);
+        if (reader == null) {
+            reader = newReader(writerSchemaForId(schemaId));
+            readersBySchemaId.put(schemaId, reader);
+        }
+        return reader;
     }
 
-    private void writeLegacy(T record, DataOutputView target) throws IOException {
-        DataOutputEncoder encoder = new DataOutputEncoder();
-        encoder.setOut(target);
+    private DatumReader<T> legacyReader() {
+        if (legacyReader == null) legacyReader = newReader(legacyWriterSchema);
+        return legacyReader;
+    }
+
+    private DatumReader<T> newReader(Schema writerSchema) {
         if (recordKind == AvroRecordKind.SPECIFIC) {
-            new org.apache.avro.specific.SpecificDatumWriter<T>(legacyWriterSchema,
-                    SpecificData.getForClass(specificClass)).write(record, encoder);
-        } else {
-            new GenericDatumWriter<T>(legacyWriterSchema).write(record, encoder);
+            return new SpecificDatumReader<>(writerSchema, readerSchema, SpecificData.getForClass(specificClass));
         }
-        encoder.flush();
+        // The historical generic reader keeps each value's own schema; the current serializer projects to its reader schema.
+        return new GenericDatumReader<>(writerSchema, readOnly ? writerSchema : readerSchema);
     }
 
+    private DatumWriter<T> writerFor(Schema writerSchema) {
+        if (writersBySchema == null) writersBySchema = new HashMap<>();
+        DatumWriter<T> writer = writersBySchema.get(writerSchema);
+        if (writer == null) {
+            if (recordKind == AvroRecordKind.SPECIFIC) {
+                writer = new SpecificDatumWriter<>(writerSchema, SpecificData.getForClass(specificClass));
+            } else {
+                writer = new GenericDatumWriter<>(writerSchema);
+            }
+            writersBySchema.put(writerSchema, writer);
+        }
+        return writer;
+    }
+
+    /** Replays the probed bytes, then serves the rest of the value straight from the Flink input view. */
     private static final class PrefixInputStream extends InputStream {
         private final byte[] prefix;
         private final DataInputView source;
         private int index;
-        private PrefixInputStream(byte[] prefix, DataInputView source) { this.prefix = prefix; this.source = source; }
-        @Override public int read() throws IOException {
+
+        private PrefixInputStream(byte[] prefix, DataInputView source) {
+            this.prefix = prefix;
+            this.source = source;
+        }
+
+        @Override
+        public int read() throws IOException {
             if (index < prefix.length) return prefix[index++] & 0xff;
-            try { return source.readUnsignedByte(); } catch (java.io.EOFException end) { return -1; }
+            try {
+                return source.readUnsignedByte();
+            } catch (EOFException end) {
+                return -1;
+            }
+        }
+
+        @Override
+        public int read(byte[] buffer, int offset, int length) throws IOException {
+            if (length == 0) return 0;
+            if (index < prefix.length) {
+                int count = Math.min(length, prefix.length - index);
+                System.arraycopy(prefix, index, buffer, offset, count);
+                index += count;
+                return count;
+            }
+            return source.read(buffer, offset, length);
         }
     }
 
-    private int schemaIdForWrite(AvroSchema schema) throws IOException {
+    private int schemaIdForWrite(Schema writerSchema) throws IOException {
+        if (schemaIdsBySchema == null) schemaIdsBySchema = new HashMap<>();
+        Integer cached = schemaIdsBySchema.get(writerSchema);
+        if (cached != null) return cached;
+        AvroSchema avroSchema = new AvroSchema(writerSchema);
         try {
             SchemaRegistryClient client = schemaRegistryClient();
-            if (booleanConfig(AUTO_REGISTER_SCHEMAS, true)) {
-                return client.register(subject, schema, booleanConfig(NORMALIZE_SCHEMAS, false));
-            }
-            return client.getId(subject, schema, booleanConfig(NORMALIZE_SCHEMAS, false));
+            boolean normalize = booleanConfig(NORMALIZE_SCHEMAS, false);
+            int schemaId = booleanConfig(AUTO_REGISTER_SCHEMAS, true)
+                    ? client.register(subject, avroSchema, normalize)
+                    : client.getId(subject, avroSchema, normalize);
+            schemaIdsBySchema.put(writerSchema, schemaId);
+            return schemaId;
         } catch (RestClientException exception) {
             throw new IOException("Could not resolve Avro schema ID for Schema Registry subject '" + subject + "'", exception);
         }
@@ -411,13 +528,13 @@ public final class SchemaResolvingAvroSerializer<T extends IndexedRecord> extend
         if (schemaRegistryClient == null) {
             Map<String, Object> clientConfig = resolveClientConfig(
                     serializerConfig, GlobalConfiguration.loadConfiguration().toMap(), System.getenv());
-            Object configuredUrl = clientConfig.get("schema.registry.url");
+            Object configuredUrl = clientConfig.get(SCHEMA_REGISTRY_URL);
             if (configuredUrl == null || configuredUrl.toString().isBlank()) {
-                throw new IllegalStateException("Schema Registry config must include schema.registry.url");
+                throw new IllegalStateException("Schema Registry config must include " + SCHEMA_REGISTRY_URL);
             }
-            Object maxSchemas = clientConfig.remove("max.schemas.per.subject");
+            Object maxSchemas = clientConfig.remove(MAX_SCHEMAS_PER_SUBJECT);
             int cacheCapacity = maxSchemas == null ? SCHEMA_REGISTRY_CACHE_CAPACITY
-                    : integerConfig("max.schemas.per.subject", maxSchemas);
+                    : integerConfig(MAX_SCHEMAS_PER_SUBJECT, maxSchemas);
             LOG.debug("Initializing Schema Registry client for literal subject '{}' and record kind {}", subject, recordKind);
             schemaRegistryClient = SchemaRegistryClientFactory.newClient(configuredUrl.toString(), cacheCapacity,
                     List.of(new AvroSchemaProvider()), clientConfig, Map.of());
@@ -425,40 +542,32 @@ public final class SchemaResolvingAvroSerializer<T extends IndexedRecord> extend
         return schemaRegistryClient;
     }
 
-    private byte[] encodeDatum(T record, Schema writerSchema) throws IOException {
-        ByteArrayOutputStream bytes = new ByteArrayOutputStream();
-        BinaryEncoder encoder = EncoderFactory.get().directBinaryEncoder(bytes, null);
-        if (recordKind == AvroRecordKind.SPECIFIC) {
-            @SuppressWarnings("unchecked")
-            SpecificRecord specificRecord = (SpecificRecord) record;
-            new SpecificDatumWriter<SpecificRecord>(writerSchema, SpecificData.getForClass(specificClass))
-                    .write(specificRecord, encoder);
-        } else {
-            new GenericDatumWriter<T>(writerSchema).write(record, encoder);
-        }
-        encoder.flush();
-        return bytes.toByteArray();
-    }
-
     private T projectToReaderSchema(T record) throws IOException {
         Schema writerSchema = record.getSchema();
-        if (writerSchema.equals(readerSchema)) {
-            return record;
-        }
-        byte[] encoded = encodeDatum(record, writerSchema);
-        BinaryDecoder decoder = DecoderFactory.get().binaryDecoder(new ByteArrayInputStream(encoded), null);
-        return readDatum(writerSchema, null, decoder);
+        ByteArrayOutputStream bytes = new ByteArrayOutputStream();
+        BinaryEncoder encoder = EncoderFactory.get().directBinaryEncoder(bytes, null);
+        writerFor(writerSchema).write(record, encoder);
+        encoder.flush();
+        BinaryDecoder decoder = DecoderFactory.get().binaryDecoder(bytes.toByteArray(), null);
+        return newReader(writerSchema).read(null, decoder);
     }
 
-    @SuppressWarnings("unchecked")
-    private T readDatum(Schema writerSchema, T reuse, org.apache.avro.io.Decoder decoder) throws IOException {
-        if (recordKind == AvroRecordKind.SPECIFIC) {
-            return new SpecificDatumReader<T>(writerSchema, readerSchema,
-                    SpecificData.getForClass(specificClass)).read(reuse, decoder);
+    static void writeVarInt(DataOutputView out, int value) throws IOException {
+        while ((value & ~0x7f) != 0) {
+            out.writeByte((value & 0x7f) | 0x80);
+            value >>>= 7;
         }
-        GenericRecord genericReuse = (GenericRecord) reuse;
-        Schema genericReaderSchema = readOnly ? writerSchema : readerSchema;
-        return (T) new GenericDatumReader<GenericRecord>(writerSchema, genericReaderSchema).read(genericReuse, decoder);
+        out.writeByte(value);
+    }
+
+    static int readVarInt(DataInputView in) throws IOException {
+        int result = 0;
+        for (int shift = 0; shift < 35; shift += 7) {
+            int next = in.readUnsignedByte();
+            result |= (next & 0x7f) << shift;
+            if ((next & 0x80) == 0) return result;
+        }
+        throw new IOException("Malformed schema ID varint");
     }
 
     private static String requireNonBlank(String value, String name) {
@@ -490,8 +599,9 @@ public final class SchemaResolvingAvroSerializer<T extends IndexedRecord> extend
 
     private static boolean isSerializerConfigKey(String key) {
         return switch (key) {
-            case "schema.registry.url", AUTO_REGISTER_SCHEMAS, NORMALIZE_SCHEMAS,
-                    FORCE_MIGRATION_NONCE, "max.schemas.per.subject" -> true;
+            case SCHEMA_REGISTRY_URL, AUTO_REGISTER_SCHEMAS, NORMALIZE_SCHEMAS, MAX_SCHEMAS_PER_SUBJECT,
+                    FORCE_MIGRATION_NONCE, FRAME_MAGIC, VERIFY_SCHEMA_COMPATIBILITY,
+                    USE_UNSAFE_MAGIC, ALLOW_FULL_MIGRATION -> true;
             default -> false;
         };
     }
@@ -501,9 +611,7 @@ public final class SchemaResolvingAvroSerializer<T extends IndexedRecord> extend
             Map<String, String> flinkConfig,
             Map<String, String> environment) {
         Map<String, Object> resolved = new LinkedHashMap<>(serializerConfig);
-        resolved.remove(AUTO_REGISTER_SCHEMAS);
-        resolved.remove(NORMALIZE_SCHEMAS);
-        resolved.remove(FORCE_MIGRATION_NONCE);
+        resolved.keySet().removeIf(SchemaResolvingAvroSerializer::isSerializerControlKey);
 
         Map<String, SecretReference> secretReferences = new LinkedHashMap<>();
         for (Map.Entry<String, String> entry : flinkConfig.entrySet()) {
@@ -584,9 +692,11 @@ public final class SchemaResolvingAvroSerializer<T extends IndexedRecord> extend
     private record SecretReference(String environmentVariable, String filePath) { }
 
     private static boolean isSerializerControlKey(String key) {
-        return AUTO_REGISTER_SCHEMAS.equals(key)
-                || NORMALIZE_SCHEMAS.equals(key)
-                || FORCE_MIGRATION_NONCE.equals(key);
+        return switch (key) {
+            case AUTO_REGISTER_SCHEMAS, NORMALIZE_SCHEMAS, FORCE_MIGRATION_NONCE, FRAME_MAGIC,
+                    VERIFY_SCHEMA_COMPATIBILITY, USE_UNSAFE_MAGIC, ALLOW_FULL_MIGRATION -> true;
+            default -> false;
+        };
     }
 
     private boolean booleanConfig(String key, boolean defaultValue) {
@@ -604,34 +714,32 @@ public final class SchemaResolvingAvroSerializer<T extends IndexedRecord> extend
         throw new IllegalArgumentException("Config '" + key + "' must be a boolean");
     }
 
-    private static Integer integerNonceConfig(Map<String, ?> config, String key) {
-        Object value = config.get(key);
+    static byte[] configuredFrameMagic(Map<String, ?> config) {
+        Object value = config.get(FRAME_MAGIC);
         if (value == null) return null;
-        if (!(value instanceof Number)) {
-            throw new IllegalArgumentException("Config '" + key + "' must be a number");
+        String hex = value.toString().trim();
+        if (!hex.matches("([0-9A-Fa-f]{2}){1," + MAX_FRAME_MAGIC_BYTES + "}")) {
+            throw new IllegalArgumentException("Config '" + FRAME_MAGIC + "' must be 1 to " + MAX_FRAME_MAGIC_BYTES
+                    + " bytes as hex, for example FF or 53524156524F");
         }
-        try {
-            return Integer.parseInt(value.toString());
-        } catch (NumberFormatException exception) {
-            throw new IllegalArgumentException("Config '" + key + "' must be a 32-bit integer", exception);
+        byte[] magic = new byte[hex.length() / 2];
+        for (int index = 0; index < magic.length; index++) {
+            magic[index] = (byte) Integer.parseInt(hex.substring(2 * index, 2 * index + 2), 16);
         }
+        return magic;
     }
 
-    static Integer migrationNonceFromConfig(
-            Map<String, ?> serializerConfig, Map<String, ?> flinkConfig) {
+    static Integer migrationNonceFromConfig(Map<String, ?> serializerConfig, Map<String, ?> flinkConfig) {
         Object mapValue = serializerConfig.get(FORCE_MIGRATION_NONCE);
-        Object configuredValue = mapValue != null
-                ? mapValue
-                : flinkConfig.get(FLINK_CONFIG_PREFIX + FORCE_MIGRATION_NONCE);
-        if (configuredValue == null) return null;
+        return parseNonce(mapValue != null ? mapValue : flinkConfig.get(FLINK_CONFIG_PREFIX + FORCE_MIGRATION_NONCE));
+    }
+
+    private static Integer parseNonce(Object value) {
+        if (value == null) return null;
         try {
-            if (configuredValue instanceof Number number) {
-                return Integer.parseInt(number.toString());
-            }
-            return Integer.parseInt(configuredValue.toString());
+            return Integer.parseInt(value.toString().trim());
         } catch (NumberFormatException exception) {
-            throw new IllegalArgumentException("Config '" + FORCE_MIGRATION_NONCE
-                    + "' must be a 32-bit integer", exception);
+            throw new IllegalArgumentException("Config '" + FORCE_MIGRATION_NONCE + "' must be a 32-bit integer", exception);
         }
     }
 

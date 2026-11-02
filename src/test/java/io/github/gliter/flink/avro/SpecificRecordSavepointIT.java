@@ -14,6 +14,7 @@ import org.apache.flink.api.common.state.ValueStateDescriptor;
 import org.apache.flink.api.common.typeutils.TypeSerializer;
 import org.apache.flink.configuration.Configuration;
 import org.apache.flink.configuration.CoreOptions;
+import org.apache.flink.configuration.RestOptions;
 import org.apache.flink.configuration.StateBackendOptions;
 import org.apache.flink.configuration.StateRecoveryOptions;
 import org.apache.flink.core.execution.JobClient;
@@ -69,6 +70,7 @@ class SpecificRecordSavepointIT {
     void restoresSpecificRecordStateFromV1JobWithV2GeneratedClass() throws Exception {
         Configuration miniClusterConfiguration = new Configuration();
         miniClusterConfiguration.set(CoreOptions.TMP_DIRS, flinkTempDirectory());
+        miniClusterConfiguration.set(RestOptions.BIND_PORT, "0"); // a random port, so a busy 8081 does not fail the test
         try (GeneratedArtifact v1 = generatedArtifact(V1);
              GeneratedArtifact v2 = generatedArtifact(V2)) {
             MiniCluster cluster = new MiniCluster(new MiniClusterConfiguration.Builder()
@@ -79,7 +81,7 @@ class SpecificRecordSavepointIT {
                 Map<String, Object> writerConfig = Map.of("auto.register.schemas", true);
                 Map<String, Object> migrationConfig = Map.of(
                         "auto.register.schemas", true,
-                        "force.migration.nonce", 1);
+                        "force.migration.nonce", 1, "allow.full.migration", true);
                 Path directory = Files.createTempDirectory("specific-record-savepoint");
                 String savepoint = writeSavepoint(cluster, directory, v1,
                         new ValueStateDescriptor<>("customer", serializer(v1.recordClass(), writerConfig)));
@@ -103,6 +105,7 @@ class SpecificRecordSavepointIT {
     void restoresDefaultAvroSerializerStateFromSpecificRecordClass() throws Exception {
         Configuration miniClusterConfiguration = new Configuration();
         miniClusterConfiguration.set(CoreOptions.TMP_DIRS, flinkTempDirectory());
+        miniClusterConfiguration.set(RestOptions.BIND_PORT, "0"); // a random port, so a busy 8081 does not fail the test
         try (GeneratedArtifact v1 = generatedArtifact(V1);
              GeneratedArtifact v2 = generatedArtifact(V2)) {
             MiniCluster cluster = new MiniCluster(new MiniClusterConfiguration.Builder()

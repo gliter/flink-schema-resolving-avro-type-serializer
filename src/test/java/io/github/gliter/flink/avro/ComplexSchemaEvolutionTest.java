@@ -145,6 +145,7 @@ class ComplexSchemaEvolutionTest {
         config.put("schema.registry.url", registryUrl);
         config.put("auto.register.schemas", true);
         if (forceMigration) config.put("force.migration.nonce", 1);
+        if (forceMigration) config.put("allow.full.migration", true);
         return Map.copyOf(config);
     }
 
@@ -285,8 +286,8 @@ class ComplexSchemaEvolutionTest {
 
     private static int schemaId(byte[] bytes) throws Exception {
         DataInputDeserializer input = new DataInputDeserializer(bytes);
-        input.skipBytesToRead(SchemaResolvingAvroSerializer.WIRE_MAGIC.length + 1 + 1 + Integer.BYTES + 1);
-        return input.readInt();
+        input.skipBytesToRead(SchemaResolvingAvroSerializer.DEFAULT_FRAME_MAGIC.length + 1);
+        return SchemaResolvingAvroSerializer.readVarInt(input);
     }
 
     private static GeneratedRecords generatedRecords(Schema schema) throws Exception {

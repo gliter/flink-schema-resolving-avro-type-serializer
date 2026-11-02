@@ -1,5 +1,6 @@
 package io.github.gliter.flink.avro;
 
+import io.github.gliter.flink.avro.LegacyFrameAnalysis.FrameMagicChoice;
 import org.apache.avro.Schema;
 import org.apache.avro.generic.IndexedRecord;
 import org.apache.flink.api.common.typeutils.TypeSerializer;
@@ -15,18 +16,25 @@ import java.io.IOException;
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.nio.charset.StandardCharsets;
+import java.util.Arrays;
 import java.util.Objects;
 
-/** Snapshot of record kind, specific-record identity, legacy raw-Avro schema, and migration nonce. */
+/** Snapshot of record kind, specific-record identity, frame magic, subject, legacy raw-Avro schema, and migration nonce. */
 public final class SchemaResolvingAvroSerializerSnapshot<T extends IndexedRecord>
         implements TypeSerializerSnapshot<T> {
     private static final Logger LOG = LoggerFactory.getLogger(SchemaResolvingAvroSerializerSnapshot.class);
     private static final int VERSION = 1;
     private static final int MAX_SCHEMA_BYTES = 64 * 1024 * 1024;
+    private static final int MAX_STRING_BYTES = 1024 * 1024;
+    private static final int MAX_FRAME_MAGIC_BYTES = 16;
     private Schema legacyWriterSchema;
     private Integer completedMigrationNonce;
     private AvroRecordKind recordKind;
     private String specificClassName;
+    private byte[] frameMagic;
+    private boolean legacyValueCanBeShorterThanMagic;
+    private String subject;
+    private java.util.List<SchemaInfo> recordedSchemas = java.util.List.of();
     private transient SchemaResolvingAvroSerializer<T> currentSerializer;
     private transient ClassLoader userCodeClassLoader;
 
@@ -38,6 +46,10 @@ public final class SchemaResolvingAvroSerializerSnapshot<T extends IndexedRecord
         this.completedMigrationNonce = serializer.completedMigrationNonce();
         this.recordKind = serializer.recordKind();
         this.specificClassName = serializer.specificClass() == null ? null : serializer.specificClass().getName();
+        this.frameMagic = serializer.frameMagic();
+        this.legacyValueCanBeShorterThanMagic = serializer.legacyValueCanBeShorterThanMagic();
+        this.subject = serializer.subject();
+        this.recordedSchemas = serializer.recordedSchemas();
     }
 
     @Override public int getCurrentVersion() { return VERSION; }
@@ -46,9 +58,7 @@ public final class SchemaResolvingAvroSerializerSnapshot<T extends IndexedRecord
     public void writeSnapshot(DataOutputView out) throws IOException {
         out.writeBoolean(legacyWriterSchema != null);
         if (legacyWriterSchema != null) {
-            byte[] schema = legacyWriterSchema.toString().getBytes(StandardCharsets.UTF_8);
-            out.writeInt(schema.length);
-            out.write(schema);
+            writeString(out, legacyWriterSchema.toString());
         }
         out.writeBoolean(completedMigrationNonce != null);
         if (completedMigrationNonce != null) out.writeInt(completedMigrationNonce);
@@ -57,26 +67,25 @@ public final class SchemaResolvingAvroSerializerSnapshot<T extends IndexedRecord
         if (recordKind == AvroRecordKind.SPECIFIC) {
             writeString(out, Objects.requireNonNull(specificClassName, "specificClassName"));
         }
+        out.writeByte(frameMagic.length);
+        out.write(frameMagic);
+        out.writeBoolean(legacyValueCanBeShorterThanMagic);
+        out.writeBoolean(subject != null);
+        if (subject != null) writeString(out, subject);
+        out.writeInt(recordedSchemas.size());
+        for (SchemaInfo info : recordedSchemas) {
+            writeString(out, info.subject());
+            out.writeInt(info.version());
+            out.writeInt(info.schemaId());
+        }
     }
 
     @Override
     public void readSnapshot(int version, DataInputView in, ClassLoader userCodeClassLoader) throws IOException {
         if (version != VERSION) {
-            LOG.warn("Cannot read Confluent Avro serializer snapshot version {}; this build supports version {}",
-                    version, VERSION);
-            throw new IOException("Unsupported Confluent Avro serializer snapshot version: " + version);
+            throw new IOException("Unsupported schema-resolving Avro serializer snapshot version: " + version);
         }
-        if (in.readBoolean()) {
-            int schemaLength = in.readInt();
-            if (schemaLength < 0 || schemaLength > MAX_SCHEMA_BYTES) {
-                throw new IOException("Invalid legacy Avro schema length in serializer snapshot: " + schemaLength);
-            }
-            byte[] schema = new byte[schemaLength];
-            in.readFully(schema);
-            legacyWriterSchema = new Schema.Parser().parse(new String(schema, StandardCharsets.UTF_8));
-        } else {
-            legacyWriterSchema = null;
-        }
+        legacyWriterSchema = in.readBoolean() ? new Schema.Parser().parse(readString(in, MAX_SCHEMA_BYTES)) : null;
         completedMigrationNonce = in.readBoolean() ? in.readInt() : null;
         int kindId = in.readUnsignedByte();
         try {
@@ -85,12 +94,31 @@ public final class SchemaResolvingAvroSerializerSnapshot<T extends IndexedRecord
             throw new IOException("Invalid Avro record kind ID: " + kindId, exception);
         }
         if (recordKind == AvroRecordKind.SPECIFIC) {
-            specificClassName = readString(in);
+            specificClassName = readString(in, MAX_STRING_BYTES);
             this.userCodeClassLoader = userCodeClassLoader;
         } else {
             specificClassName = null;
             this.userCodeClassLoader = null;
         }
+        int magicLength = in.readUnsignedByte();
+        if (magicLength > MAX_FRAME_MAGIC_BYTES) {
+            throw new IOException("Invalid frame magic length in serializer snapshot: " + magicLength);
+        }
+        frameMagic = new byte[magicLength];
+        in.readFully(frameMagic);
+        legacyValueCanBeShorterThanMagic = in.readBoolean();
+        subject = in.readBoolean() ? readString(in, MAX_STRING_BYTES) : null;
+        int count = in.readInt();
+        if (count < 0 || count > 100000) throw new IOException("Invalid schema history size: " + count);
+        var entries = new java.util.ArrayList<SchemaInfo>();
+        for (int index = 0; index < count; index++) {
+            String name = readString(in, MAX_STRING_BYTES);
+            int schemaVersion = in.readInt();
+            int id = in.readInt();
+            if (name.isBlank() || schemaVersion <= 0 || id <= 0) throw new IOException("Invalid schema history entry");
+            entries.add(new SchemaInfo(name, schemaVersion, id));
+        }
+        recordedSchemas = java.util.List.copyOf(entries);
     }
 
     @Override
@@ -105,9 +133,11 @@ public final class SchemaResolvingAvroSerializerSnapshot<T extends IndexedRecord
                 specificClass = loadedClass;
             }
             LOG.debug("Restoring read-only historical Avro serializer for {}", recordKind);
-            return SchemaResolvingAvroSerializer.restoredReader(recordKind, specificClass, legacyWriterSchema);
+            var reader = SchemaResolvingAvroSerializer.restoredReader(recordKind, specificClass, legacyWriterSchema, frameMagic, legacyValueCanBeShorterThanMagic);
+            reader.recordedSchemas(recordedSchemas);
+            return reader;
         } catch (ReflectiveOperationException | RuntimeException exception) {
-            throw new IllegalStateException("Could not initialize historical Confluent Avro serializer", exception);
+            throw new IllegalStateException("Could not initialize historical schema-resolving Avro serializer", exception);
         }
     }
 
@@ -116,73 +146,85 @@ public final class SchemaResolvingAvroSerializerSnapshot<T extends IndexedRecord
         if (currentSerializer == null) {
             return incompatible("Current serializer snapshot is not attached to a serializer");
         }
-        if (oldSnapshot instanceof SchemaResolvingAvroSerializerSnapshot<?> confluentSnapshot) {
-            return resolveConfluentSnapshotCompatibility(confluentSnapshot);
+        if (oldSnapshot instanceof SchemaResolvingAvroSerializerSnapshot<?> previousSnapshot) {
+            return resolveOwnSnapshotCompatibility(previousSnapshot);
         }
         if (oldSnapshot instanceof AvroSerializerSnapshot<?> avroSnapshot) {
             return resolveFlinkAvroSnapshotCompatibility(avroSnapshot);
         }
-        LOG.warn("No compatibility bridge for previous serializer snapshot {}; state is incompatible",
-                oldSnapshot.getClass().getName());
-        return TypeSerializerSchemaCompatibility.incompatible();
+        return incompatible("No compatibility bridge for previous serializer snapshot " + oldSnapshot.getClass().getName());
     }
 
-    private TypeSerializerSchemaCompatibility<T> resolveConfluentSnapshotCompatibility(
+    private TypeSerializerSchemaCompatibility<T> resolveOwnSnapshotCompatibility(
             SchemaResolvingAvroSerializerSnapshot<?> previousSnapshot) {
+        if (legacyWriterSchema != null && previousSnapshot.legacyWriterSchema != null
+                && !legacyWriterSchema.equals(previousSnapshot.legacyWriterSchema)) {
+            return incompatible("Legacy raw Avro writer schemas differ: current='" + legacyWriterSchema.getFullName()
+                    + "', previous='" + previousSnapshot.legacyWriterSchema.getFullName() + "'");
+        }
+        Schema legacySchema = legacyWriterSchema == null ? previousSnapshot.legacyWriterSchema : legacyWriterSchema;
+        currentSerializer.recordedSchemas(previousSnapshot.recordedSchemas);
+        String incompatibility = currentSerializer.verifyReaderCompatibility(legacySchema, previousSnapshot.subject);
+        if (incompatibility != null) {
+            return incompatible("Reader schema cannot read every known writer schema: " + incompatibility);
+        }
+
         Integer requestedNonce = currentSerializer.forceMigrationNonce();
         if (hasNewMigrationNonce(requestedNonce, previousSnapshot.completedMigrationNonce)) {
             currentSerializer.recordMigrationNonce(requestedNonce);
-            return forceMigration("historical Confluent Avro state");
+            return forceMigration("historical schema-resolving Avro state (migration nonce " + requestedNonce + ")");
         }
-
         currentSerializer.recordMigrationNonce(previousSnapshot.completedMigrationNonce);
-        if (requestedNonce != null) {
-            LOG.debug("Migration nonce was already applied in the previous serializer snapshot");
-        }
-        return resolveLegacySchemaCompatibility(previousSnapshot.legacyWriterSchema);
-    }
 
-    private TypeSerializerSchemaCompatibility<T> resolveLegacySchemaCompatibility(Schema previousLegacySchema) {
-        if (legacyWriterSchema != null && previousLegacySchema != null
-                && !legacyWriterSchema.equals(previousLegacySchema)) {
-            LOG.warn("Incompatible legacy raw Avro schemas in serializer snapshots: current='{}', previous='{}'",
-                    legacyWriterSchema.getFullName(), previousLegacySchema.getFullName());
-            return TypeSerializerSchemaCompatibility.incompatible();
+        byte[] configuredMagic = currentSerializer.configuredFrameMagic();
+        if (configuredMagic != null && !Arrays.equals(configuredMagic, previousSnapshot.frameMagic)) {
+            return forceMigration("state framed with magic " + LegacyFrameAnalysis.hex(previousSnapshot.frameMagic)
+                    + " because frame.magic is now " + LegacyFrameAnalysis.hex(configuredMagic));
         }
-
-        Schema schemaToPreserve = legacyWriterSchema == null ? previousLegacySchema : legacyWriterSchema;
-        if (schemaToPreserve == null) {
-            LOG.debug("Confluent Avro serializer snapshots are compatible as-is");
+        if (legacySchema == null && Arrays.equals(previousSnapshot.frameMagic, currentSerializer.frameMagic())) {
+            LOG.debug("Schema-resolving Avro serializer snapshots are compatible as-is");
             return TypeSerializerSchemaCompatibility.compatibleAsIs();
         }
-
-        LOG.info("Preserving legacy raw Avro writer schema '{}' across a Confluent serializer upgrade",
-                schemaToPreserve.getFullName());
+        if (legacySchema != null) {
+            LOG.info("Preserving legacy raw Avro writer schema '{}' and frame magic {} across a serializer upgrade",
+                    legacySchema.getFullName(), LegacyFrameAnalysis.hex(previousSnapshot.frameMagic));
+        }
         return TypeSerializerSchemaCompatibility.compatibleWithReconfiguredSerializer(
-                currentSerializer.withLegacyWriterSchema(schemaToPreserve));
+                currentSerializer.reconfigured(legacySchema, previousSnapshot.frameMagic,
+                        previousSnapshot.legacyValueCanBeShorterThanMagic));
     }
 
     private TypeSerializerSchemaCompatibility<T> resolveFlinkAvroSnapshotCompatibility(
             AvroSerializerSnapshot<?> previousSnapshot) {
         Schema previousSchema = extractAvroSchema(previousSnapshot);
         if (previousSchema == null) {
-            LOG.warn("Could not extract the writer schema from Flink Avro serializer snapshot {}; state is incompatible",
-                    previousSnapshot.getClass().getName());
-            return TypeSerializerSchemaCompatibility.incompatible();
+            return incompatible("Could not extract the writer schema from Flink Avro serializer snapshot "
+                    + previousSnapshot.getClass().getName());
         }
+        String incompatibility = currentSerializer.verifyReaderCompatibility(previousSchema, null);
+        if (incompatibility != null) {
+            return incompatible("Reader schema cannot read every known writer schema: " + incompatibility);
+        }
+        String stateDescription = "regular Flink Avro state with writer schema '" + previousSchema.getFullName() + "'";
 
         Integer requestedNonce = currentSerializer.forceMigrationNonce();
         if (requestedNonce != null) {
             currentSerializer.recordMigrationNonce(requestedNonce);
-            return forceMigration("regular Flink Avro state with writer schema '"
-                    + previousSchema.getFullName() + "'");
+            return forceMigration(stateDescription + " (migration nonce " + requestedNonce + ")");
         }
 
-        LOG.info("Migrating serializer compatibility from Flink Avro snapshot using legacy writer schema '{}' "
-                        + "without rewriting state",
-                previousSchema.getFullName());
+        FrameMagicChoice choice = LegacyFrameAnalysis.chooseFrameMagic(previousSchema, currentSerializer.configuredFrameMagic(),
+                currentSerializer.useUnsafeMagic());
+        if (choice.requiresMigration()) {
+            LOG.warn("Cannot read {} in place: {}", stateDescription, choice.explanation());
+            if (currentSerializer.allowFullMigration()) return forceMigration(stateDescription);
+            return incompatible(choice.explanation() + "; set use.unsafe.magic=true to accept collision risk "
+                    + "(only when probing cannot over-read), or allow.full.migration=true "
+                    + "to rewrite legacy state with the old serializer");
+        }
+        LOG.info("Reading {} in place without rewriting it: {}", stateDescription, choice.explanation());
         return TypeSerializerSchemaCompatibility.compatibleWithReconfiguredSerializer(
-                currentSerializer.withLegacyWriterSchema(previousSchema));
+                currentSerializer.reconfigured(previousSchema, choice.magic()));
     }
 
     private static boolean hasNewMigrationNonce(Integer requestedNonce, Integer previousNonce) {
@@ -190,8 +232,13 @@ public final class SchemaResolvingAvroSerializerSnapshot<T extends IndexedRecord
     }
 
     private TypeSerializerSchemaCompatibility<T> forceMigration(String stateDescription) {
+        if (!currentSerializer.allowFullMigration()) {
+            return incompatible("A full migration is required for " + stateDescription
+                    + "; set allow.full.migration=true to permit compatible-after-migration restoration");
+        }
+        currentSerializer.recordedSchemas(java.util.List.of());
         currentSerializer.markForceMigrationPending();
-        LOG.info("Forcing a full migration of {} using migration nonce", stateDescription);
+        LOG.info("Forcing a full migration of {}", stateDescription);
         return TypeSerializerSchemaCompatibility.compatibleAfterMigration();
     }
 
@@ -228,9 +275,9 @@ public final class SchemaResolvingAvroSerializerSnapshot<T extends IndexedRecord
         out.write(bytes);
     }
 
-    private static String readString(DataInputView in) throws IOException {
+    private static String readString(DataInputView in, int maxBytes) throws IOException {
         int length = in.readInt();
-        if (length < 0 || length > 1024 * 1024) throw new IOException("Invalid snapshot class-name length: " + length);
+        if (length < 0 || length > maxBytes) throw new IOException("Invalid string length in serializer snapshot: " + length);
         byte[] bytes = new byte[length];
         in.readFully(bytes);
         return new String(bytes, StandardCharsets.UTF_8);

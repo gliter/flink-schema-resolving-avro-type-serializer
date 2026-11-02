@@ -1,7 +1,5 @@
 # Schema-Resolving Avro Serializer for Flink
 
-=== THIS IS WORK IN PROGRESS ==
-
 [![Build](https://github.com/gliter/flink-confluent-avro-type-serializer/actions/workflows/build.yml/badge.svg)](https://github.com/gliter/flink-confluent-avro-type-serializer/actions/workflows/build.yml)
 
 Need to add an Avro field to a Flink job? A regular Flink Avro serializer can require a full state rewrite after a schema change. For large state, that can take hours.
@@ -87,13 +85,46 @@ Each value carries the identity of the schema that encoded it. The serializer do
 
 ### When Flink writes a value
 
-For a non-null record, the serializer gets the record's Avro schema and asks Schema Registry for its ID under the configured subject. Depending on `auto.register.schemas`, it registers the schema or requires it to exist already. It then writes a serializer header, the schema ID, and the Avro binary datum. The ID points to the exact writer schema for that value. Null values are marked as null and have no schema ID or datum.
+The serializer gets the record's Avro schema and asks Schema Registry for its ID under the configured subject. Depending on `auto.register.schemas`, it registers the schema or requires it to exist already. It then writes the frame magic, a format version byte, the schema ID as a variable-length integer, and the Avro binary datum. The ID points to the exact writer schema for that value. New state defaults to empty magic; with a small Registry ID, the frame adds two bytes per value. The snapshot stores the magic length and bytes once; each value repeats only the magic bytes, which add no overhead when empty. Null is rejected, as with Flink's regular Avro serializer: Flink clears `ValueState` instead of storing null, rejects null list elements, and flags null map values itself.
 
 The subject controls schema registration and lookup during writes. It is not used to choose a schema when reading. This means that changing the configured subject does not change how existing values are decoded, as long as their schema IDs can still be resolved by the Registry.
 
+### Example frame bytes
+
+Assume the writer schema is a record with one string field, `name`, the value is `{"name":"Ada"}`, and Schema Registry assigns that schema ID `42`.
+
+New state uses empty magic by default:
+
+```text
+| Serializer header | Regular Avro binary datum        |
+| 01      2A        | 06             41 64 61          |
+| version schema ID | string length  UTF-8 for "Ada"   |
+```
+
+The bytes `06 41 64 61` are the complete regular Avro binary datum for this record. The serializer adds only the header before them.
+
+The wire-format version is `1` (`01`). Schema ID `42` is an unsigned varint (`2A`). Avro encodes the string's byte length, `3`, as a zigzag varint (`06`), followed by its UTF-8 bytes. There is no record header or overall value-length prefix. This complete value takes six bytes.
+
+When restoring legacy Flink Avro state with this example schema, automatic selection chooses the one-byte magic `FF`. The first field is a string: Flink encodes its length as a non-negative, four-byte big-endian integer, whose first byte cannot exceed `7F`. A legacy value therefore cannot start with `FF`, so one byte is enough to distinguish framed values without reading past a legacy value. The same newly written value then looks like this:
+
+```text
+| Serializer header        | Regular Avro binary datum        |
+| FF     01      2A         | 06             41 64 61          |
+| magic  version schema ID  | string length  UTF-8 for "Ada"   |
+```
+
+The snapshot stores the selected magic's length and bytes separately; each value contains only the magic bytes themselves. Empty magic therefore adds no bytes to a value. Schema IDs above `127` take multiple varint bytes; for example, ID `300` is `AC 02`.
+
+For comparison, the original raw legacy value written by Flink's regular Avro serializer for this schema has no magic, version or schema ID, and uses a four-byte string length:
+
+```text
+00 00 00 03       41 64 61
+string length    UTF-8 bytes for "Ada"
+```
+
 ### When Flink reads a value
 
-The serializer first checks its framing marker. For a schema-resolving value, it reads the schema ID and asks Schema Registry for the corresponding writer schema. It then decodes the Avro datum with both schemas:
+When every legacy value is at least as long as the magic, the serializer reads the entire magic into a buffer. Otherwise, it probes one byte at a time to avoid consuming bytes from the next value. This minimum-size analysis runs when bridging legacy state; the resulting flag is persisted in the snapshot and reused on subsequent restores. If every byte matches, the value is schema-resolving: it reads the schema ID and asks Schema Registry for the corresponding writer schema. If a byte does not match, the bytes read so far are replayed and the value is decoded as a raw legacy Avro value (see "Use with existing Flink Avro state"). It then decodes the Avro datum with both schemas:
 
 - The writer schema describes the fields and binary layout in the stored bytes.
 - The reader schema describes the record shape expected by the running job.
@@ -148,14 +179,62 @@ ValueStateDescriptor<GenericRecord> customerState =
 
 The old snapshot supplies the legacy writer schema for old raw-Avro values. The new serializer uses `currentSchema` to read them. New writes use the schema-resolving format. This is a format transition, not an eager conversion: old and new values can coexist until Flink reads and updates an old value. Values that the job does not touch can remain in raw-Avro format.
 
+### How legacy values are told apart
+
+A raw legacy value has no header, so the serializer must recognise its own frame magic without ever mistaking a legacy value for it (a collision) or reading past the end of a short legacy value (an over-read). Flink's regular Avro serializer does not use Avro binary encoding: it writes int, float, enum and union indexes as 4 big-endian bytes, long and double as 8, strings and bytes with a 4-byte big-endian length, and only array and map item counts as varints. At restore time the serializer derives an all-`FF` magic directly from the legacy writer schema. For an explicit override or unsafe fallback, a byte-level analysis checks possible collisions and over-reads. The selected magic and the reason for the choice are logged:
+
+- The schema determines the required all-`FF` prefix directly, up to eight bytes. Fixed-width numeric fields advance the prefix offset; the first constrained field determines its length. A legacy value that starts with a string, bytes, union, enum or boolean field can never begin with a byte above `0x7F`, so for those schemas the one-byte magic `0xFF` is proven exact and legacy values of any length, even a single byte, are read correctly. An array or map first field needs five bytes, because its varint count cannot carry five continuation bytes.
+- If no candidate can be proven, for example when the value starts with a long followed by a double, with `use.unsafe.magic=true` the serializer falls back to the six-byte magic `0x53524156524F` (`SRAVRO`), provided no legacy value can be a proper prefix of it, and logs that detection relies on a legacy value not beginning with those six bytes by coincidence.
+- If even that can over-read, for example a record with a single int field, or a schema that can encode to zero bytes, no magic is safe. Restore returns incompatible unless `allow.full.migration=true` requests a full migration.
+
+Set `frame.magic` in `serializerConfig` to a hex string to choose the magic yourself. An explicit magic must be proven safe by default. When no proven safe magic is available, restore returns incompatible and logs two options: `use.unsafe.magic=true` accepts collision risk (but never over-read), or `allow.full.migration=true` forces a full rewrite using the old serializer. If both options are enabled, an accepted unsafe magic allows the lazy transition; otherwise full migration is permitted. The chosen magic is stored in the serializer snapshot and carried across later restores, so later jobs do not need to configure it. Changing `frame.magic` for state that already holds framed values forces a full migration.
+
+Both options belong in `serializerConfig` and default to `false`. For example, to require a full rewrite whenever the selected legacy magic cannot be proven safe:
+
+```java
+Map<String, Object> serializerConfig = Map.of(
+    "schema.registry.url", "https://schema-registry.example",
+    "allow.full.migration", true);
+```
+
+Alternatively, set `"use.unsafe.magic", true` to allow the unsafe fallback. This accepts a risk of misreading a legacy value whose bytes happen to match the magic; it never allows a magic that can read past the value. If no acceptable magic exists, restore returns incompatible unless `allow.full.migration=true` permits a full rewrite.
+
+The migration policy applies when taking over regular Flink Avro state and the chosen magic is not proven safe. Flink reads all old values with its original Avro serializer and writes them with the current serializer, leaving no raw legacy values. With no explicit `frame.magic`, these rewritten values use empty magic. If a proven-safe magic is available, this policy keeps the lazy transition; use `force.migration.nonce` to request a rewrite regardless of magic safety. After a successful migration, later snapshots describe framed state, so leaving the policy enabled does not trigger repeated rewrites.
+
+### Restore scenarios
+
+Options below are set in `serializerConfig`. Unless stated otherwise, options are unset: `allow.full.migration=false`, `use.unsafe.magic=false`, and no migration nonce or explicit magic. Restore rows assume Avro compatibility verification succeeds; the final rows describe verification failures.
+
+| Situation | Options set | What happens |
+| --- | --- | --- |
+| Fresh state | Defaults | Writes with empty magic, followed by version, schema ID and regular Avro bytes. No legacy schema is stored. |
+| Fresh state | `frame.magic="AB"` | Writes with the explicit magic and stores it in the snapshot. No rewrite is needed. |
+| Fresh state | `allow.full.migration=true` | Same as the default fresh-state case; permission alone does not trigger migration. |
+| Legacy Flink Avro state; a proven-safe automatic magic exists | Defaults | Lazy transition: selects magic from the legacy schema, preserves that schema in the snapshot, and allows old raw and new framed values to coexist. |
+| Legacy state; a proven-safe explicit magic is supplied | `frame.magic` | Lazy transition using the explicit magic. |
+| Legacy state; no proven-safe selected magic exists | Defaults | Returns incompatible unless `allow.full.migration=true` permits a full rewrite using the original Flink Avro reader. The rewrite drops the legacy schema and uses empty magic unless explicitly configured. Logs the unsafe-magic and full-migration options. |
+| Legacy state; unsafe fallback or explicit magic can collide but cannot over-read | `use.unsafe.magic=true` | Lazy transition accepting collision risk. Uses the explicit magic, or the `SRAVRO` fallback when no safe automatic magic is found. |
+| Legacy state; unsafe magic is requested | `use.unsafe.magic=true` | Allows a lazy transition with collision risk, but never over-read. If the selected magic can over-read, returns incompatible unless `allow.full.migration=true` permits a full rewrite instead. |
+| Existing framed state, possibly mixed with raw legacy values | Same magic, or `frame.magic` removed; no new nonce | Preserves the snapshot's magic and any legacy schema. Removing the explicit option does not reset magic to empty. No full rewrite. |
+| Existing framed state | Different explicit `frame.magic` | Returns incompatible unless `allow.full.migration=true`. When enabled, fully rewrites using the old reader and new magic, dropping any legacy schema. No nonce change is needed. |
+| Supported legacy or framed state | New `force.migration.nonce` | Returns incompatible unless `allow.full.migration=true`. When enabled, fully rewrites to the current schema and configured magic (empty by default), drops the legacy schema, and saves the nonce in the next snapshot. |
+| Framed state after a completed nonce-triggered migration | Same nonce | Does not repeat the rewrite; ordinary magic compatibility rules still apply. |
+| Reader schema cannot read a checked legacy or registered writer schema | Verification enabled (default) | Returns incompatible. Migration permission does not override Avro incompatibility. |
+| Reader schema compatibility is not checked | `verify.schema.compatibility=false` | Skips verification; magic and migration rules still apply. Unreadable values can fail during decoding. |
+| Registry access or reader-schema registration/lookup fails during verification | Verification enabled (default) | Restore fails with an error. Migration permission does not bypass Registry failures. |
+| Previous snapshot uses an unsupported serializer | Any options | Returns incompatible; these options do not enable arbitrary serializer migrations. |
+
 ## Force a full migration
+
+Full state rewrites require `allow.full.migration=true` in `serializerConfig`; it defaults to `false`. This gate applies to nonce changes, explicit magic changes, and legacy restores with no accepted magic. Without permission, a restore requiring a rewrite returns incompatible and logs that enabling `allow.full.migration` permits migration. When legacy magic cannot be accepted, permission allows a rewrite; otherwise permission alone does not request one, and it does not override incompatible Avro schemas. Lazy restores do not require it.
 
 Lazy schema resolution avoids a full rewrite, but some operational changes may require all stored values to use the current schema and wire format. For example, you may want to finish the transition from regular Flink Avro state or remove old schema versions from active state. In that case, request a full migration by setting `force.migration.nonce` to an integer in `serializerConfig`:
 
 ```java
 Map<String, Object> migrationConfig = Map.of(
     "auto.register.schemas", true,
-    "force.migration.nonce", 1);
+    "force.migration.nonce", 1,
+    "allow.full.migration", true);
 ```
 
 You can also set the nonce in Flink's global configuration by using the `schema.resolving.avro.` prefix:
@@ -189,6 +268,10 @@ Keep the same integer after the migration. That value tells later restores that 
 | `normalize.schemas` | `false` | Normalize schemas before registration or lookup. |
 | `max.schemas.per.subject` | `1000` | Set the Schema Registry client's schema cache size. |
 | `force.migration.nonce` | Not set | Request a full migration when the integer changes. Set it in `serializerConfig` or as `schema.resolving.avro.force.migration.nonce` in Flink global config. The map value takes priority. |
+| `allow.full.migration` | `false` | Permit full rewrites requested by nonce changes, magic changes or the legacy unsafe-magic migration policy. Otherwise return incompatible with a diagnostic. |
+| `use.unsafe.magic` | `false` | Allow potentially colliding legacy magic, provided it cannot over-read. |
+| `frame.magic` | Chosen automatically | Hex bytes that start every framed value, for example `FF` or `53524156524F`. Unset, the serializer uses empty magic for new state and picks a magic from the legacy writer schema when taking over regular Flink Avro state. Changing it for existing framed state forces a full migration. |
+| `verify.schema.compatibility` | `true` | At restore time, check that the current reader schema can read every recorded writer schema potentially present in state and any legacy raw-Avro writer schema, and register the reader schema. Restore fails fast on an incompatibility instead of failing later when a value is read. Set to `false` to skip the check. |
 
 The writer uses the subject exactly as you pass it. It does not add `-value` or apply a subject naming strategy. With `auto.register.schemas=true`, the writer can register a schema under that subject. With it set to `false`, the schema must already be registered there. The serializer stores the returned schema ID in each value. Reads use that ID, not the subject, to find the writer schema.
 
@@ -219,7 +302,7 @@ The environment variable or file must contain the raw value expected by the name
 
 ## Limits and operational notes
 
-Schema evolution still follows Avro's writer/reader compatibility rules. A value that cannot be resolved to the current reader schema fails when Flink reads it; the serializer does not repair incompatible schemas. A field added to the reader schema usually needs a default to read values written before that field existed.
+Schema evolution still follows Avro's writer/reader compatibility rules; the serializer does not repair incompatible schemas. A field added to the reader schema usually needs a default to read values written before that field existed. Because state can hold values written under any earlier schema version, the serializer checks at restore time that the reader schema can read every recorded writer schema potentially present in state and fails the restore otherwise (`verify.schema.compatibility`). Registry compatibility policy is independent: `BACKWARD_TRANSITIVE` can still reject a schema against versions removed from state by a full rewrite. Choose that policy according to the subject's other consumers as well as this serializer.
 
 The legacy bridge supports one raw-Avro writer schema from the previous Flink serializer snapshot. New schema-resolving values do not have this limit because each value stores a Registry schema ID. Schema IDs must remain resolvable in the Registry used by the running job. The client may serve a schema from its cache, but a cache miss needs a Registry request, so the Flink processes need network access and valid credentials.
 
@@ -234,7 +317,7 @@ The default build uses Java 17 and Flink 2.3.0. The build can also target Java 2
 ./gradlew check -PjavaVersion=21 '-PflinkVersion=2.2.1'
 ```
 
-GitHub Actions runs the test matrix for Java 17 and 21 with Flink 2.2.1 and 2.3.0. Unit tests cover serializer framing, null values, copying, schema compatibility, and legacy raw-Avro reads. RocksDB-backed Flink MiniCluster tests create and restore savepoints for `GenericRecord` and generated `SpecificRecord` values. These tests exercise state restore through Flink, not only direct calls to the serializer.
+GitHub Actions runs the test matrix for Java 17 and 21 with Flink 2.2.1 and 2.3.0. Unit tests cover serializer framing, null rejection, copying, restore-time schema compatibility checks, legacy raw-Avro reads, and frame magic selection from legacy schemas. RocksDB-backed Flink MiniCluster tests create and restore savepoints for `GenericRecord` and generated `SpecificRecord` values. These tests exercise state restore through Flink, not only direct calls to the serializer.
 
 ## Publishing
 
@@ -247,3 +330,5 @@ To create a signed release bundle locally, provide the Gradle properties `signin
 ```shell
 ./gradlew centralBundle -PlibraryVersion=1.2.3 -PreleaseBuild=true -PflinkVersion=2.3.0
 ```
+
+Writer schema history is stored as `SchemaInfo(subject, version, schemaId)` entries. Initialization records the configured runtime schema; lazy restores preserve all previous entries, including previous subjects. Compatibility checks resolve recorded IDs rather than scanning Registry history. Full rewrites reset the list to the current writer. DEBUG logs list entries; INFO logs show distinct candidate-version counts per subject. Normal GenericRecord writes must use the configured schema; forced migration projects historical records before writing.

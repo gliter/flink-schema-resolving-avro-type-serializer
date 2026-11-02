@@ -13,6 +13,7 @@ import org.apache.flink.api.common.state.ValueState;
 import org.apache.flink.api.common.state.ValueStateDescriptor;
 import org.apache.flink.configuration.Configuration;
 import org.apache.flink.configuration.CoreOptions;
+import org.apache.flink.configuration.RestOptions;
 import org.apache.flink.configuration.PipelineOptions;
 import org.apache.flink.configuration.StateBackendOptions;
 import org.apache.flink.configuration.StateRecoveryOptions;
@@ -56,6 +57,7 @@ class GenericRecordSavepointIT {
         Path savepointDirectory = Files.createTempDirectory("confluent-avro-savepoint");
         Configuration miniClusterConfiguration = new Configuration();
         miniClusterConfiguration.set(CoreOptions.TMP_DIRS, flinkTempDirectory());
+        miniClusterConfiguration.set(RestOptions.BIND_PORT, "0"); // a random port, so a busy 8081 does not fail the test
         Map<String, Object> schemaRegistryConfig = Map.of("auto.register.schemas", true);
         MiniCluster cluster = new MiniCluster(new MiniClusterConfiguration.Builder()
                 .setConfiguration(miniClusterConfiguration)
@@ -77,11 +79,12 @@ class GenericRecordSavepointIT {
         Path savepointDirectory = Files.createTempDirectory("forced-avro-savepoint");
         Configuration miniClusterConfiguration = new Configuration();
         miniClusterConfiguration.set(CoreOptions.TMP_DIRS, flinkTempDirectory());
+        miniClusterConfiguration.set(RestOptions.BIND_PORT, "0"); // a random port, so a busy 8081 does not fail the test
         String registryUrl = "mock://flink-it-registry";
         Map<String, Object> writerConfig = Map.of("auto.register.schemas", true);
         Map<String, Object> migrationConfig = Map.of(
                 "auto.register.schemas", true,
-                "force.migration.nonce", 1);
+                "force.migration.nonce", 1, "allow.full.migration", true);
         MiniCluster cluster = new MiniCluster(new MiniClusterConfiguration.Builder()
                 .setConfiguration(miniClusterConfiguration).setNumTaskManagers(1).setNumSlotsPerTaskManager(1).build());
         try {
@@ -92,7 +95,7 @@ class GenericRecordSavepointIT {
 
             Map<String, Object> regularMigrationConfig = Map.of(
                     "auto.register.schemas", true,
-                    "force.migration.nonce", 1);
+                    "force.migration.nonce", 1, "allow.full.migration", true);
             String regularAvroSavepoint = writeRegularFlinkAvroSavepoint(cluster, savepointDirectory);
             assertEquals("Ada|standard", restoreWithV2(cluster, regularAvroSavepoint, regularMigrationConfig));
             assertSchemaRegistered(registryUrl);
@@ -113,6 +116,7 @@ class GenericRecordSavepointIT {
         Path savepointDirectory = Files.createTempDirectory("legacy-avro-savepoint");
         Configuration miniClusterConfiguration = new Configuration();
         miniClusterConfiguration.set(CoreOptions.TMP_DIRS, flinkTempDirectory());
+        miniClusterConfiguration.set(RestOptions.BIND_PORT, "0"); // a random port, so a busy 8081 does not fail the test
         Map<String, Object> schemaRegistryConfig = Map.of("auto.register.schemas", true);
         MiniCluster cluster = new MiniCluster(new MiniClusterConfiguration.Builder()
                 .setConfiguration(miniClusterConfiguration).setNumTaskManagers(1).setNumSlotsPerTaskManager(1).build());
