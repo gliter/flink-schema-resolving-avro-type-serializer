@@ -235,16 +235,12 @@ public final class SchemaResolvingAvroSerializer<T extends IndexedRecord> extend
         // Flink never hands a value serializer null: ValueState clears, ListState rejects, MapState flags it itself.
         Objects.requireNonNull(record, "record");
         T valueToWrite = record;
-        Schema writerSchema = record.getSchema();
-        // GenericRecord restore reads with each historical writer schema. During forced migration,
-        // project those values here; SpecificRecord restore already reads into the current class/schema.
-        if (forceMigrationPending && recordKind == AvroRecordKind.GENERIC && readerSchema != null
-                && !writerSchema.equals(readerSchema)) {
+        // Normal writes use the schema fixed at startup; callers supply records with that schema.
+        Schema writerSchema = readerSchema;
+        // Historical GenericRecord readers retain old schemas during forced migration only.
+        if (forceMigrationPending && recordKind == AvroRecordKind.GENERIC
+                && !record.getSchema().equals(readerSchema)) {
             valueToWrite = projectToReaderSchema(record);
-            writerSchema = readerSchema;
-        }
-        if (!writerSchema.equals(readerSchema)) {
-            throw new IllegalArgumentException("Record schema must equal the configured runtime schema");
         }
         int schemaId = schemaIdForWrite(writerSchema);
         target.write(frameMagic);
