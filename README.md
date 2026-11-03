@@ -1,6 +1,6 @@
 # Schema-Resolving Avro Serializer for Flink
 
-[![Build](https://github.com/gliter/flink-confluent-avro-type-serializer/actions/workflows/build.yml/badge.svg)](https://github.com/gliter/flink-confluent-avro-type-serializer/actions/workflows/build.yml)
+[![Build](https://github.com/gliter/flink-schema-resolving-avro-type-serializer/actions/workflows/build.yml/badge.svg)](https://github.com/gliter/flink-schema-resolving-avro-type-serializer/actions/workflows/build.yml)
 
 Need to add an Avro field to a Flink job? A regular Flink Avro serializer can require a full state rewrite after a schema change. For large state, that can take hours.
 
@@ -33,7 +33,7 @@ Add the library and runtime dependencies. Use versions that match your Flink set
 
 ```kotlin
 dependencies {
-    implementation("io.github.gliter:schema-resolving-avro-serializer:0.1.0-2.3.0")
+    implementation("io.github.gliter:flink-schema-resolving-avro-type-serializer:0.1.0-2.3.0")
     compileOnly("org.apache.flink:flink-streaming-java:2.3.0")
     compileOnly("org.apache.flink:flink-avro:2.3.0")
     runtimeOnly("io.confluent:kafka-schema-registry-client:8.1.1")
@@ -321,7 +321,7 @@ GitHub Actions runs the test matrix for Java 17 and 21 with Flink 2.2.1 and 2.3.
 
 ## Publishing
 
-The Maven Central coordinates are `io.github.gliter:schema-resolving-avro-serializer`. Published versions use the format `major.minor.patch-<Flink version>`, which makes the target Flink line visible in the version. Local builds use the same format with a `-SNAPSHOT` suffix. The default local build version is `1.0.0-2.3.0-SNAPSHOT`. Set the local library version part with `-PlibraryVersion=1.2.3`.
+The Maven Central coordinates are `io.github.gliter:flink-schema-resolving-avro-type-serializer`. Published versions use the format `major.minor.patch-<Flink version>`, which makes the target Flink line visible in the version. Local builds use the same format with a `-SNAPSHOT` suffix. The default local build version is `1.0.0-2.3.0-SNAPSHOT`. Set the local library version part with `-PlibraryVersion=1.2.3`.
 
 The release workflow takes the library version from a tag such as `v1.2.3`; it does not compare the tag with the local development version. It builds and uploads a separate non-SNAPSHOT artifact for each supported Flink version (for example, `1.2.3-2.2.1` and `1.2.3-2.3.0`). It creates a GitHub Release with generated notes after Central accepts both uploads; Central validation and publication continue asynchronously, so the artifacts may not yet be available in Maven Central when the GitHub Release appears. Before release, configure the repository secrets `SIGNING_KEY`, `SIGNING_PASSWORD`, and `CENTRAL_TOKEN`; the Central token must be the base64 form of `username:password`. The `io.github.gliter` namespace must be verified in Sonatype Central.
 

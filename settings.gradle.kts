@@ -1,1 +1,1 @@
-rootProject.name = "schema-resolving-avro-serializer"
+rootProject.name = "flink-schema-resolving-avro-type-serializer"

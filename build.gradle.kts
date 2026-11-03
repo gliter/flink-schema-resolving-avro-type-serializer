@@ -96,18 +96,18 @@ tasks.javadoc { options.encoding = "UTF-8" }
 publishing {
     publications {
         create<MavenPublication>("mavenJava") {
-            artifactId = "schema-resolving-avro-serializer"
+            artifactId = "flink-schema-resolving-avro-type-serializer"
             from(components["java"])
             pom {
-                name.set("Schema Resolving Avro Serializer for Flink")
+                name.set("flink-schema-resolving-avro-type-serializer")
                 description.set("Apache Flink TypeSerializer for lazy Avro schema resolution and state migration.")
-                url.set("https://github.com/gliter/flink-confluent-avro-type-serializer")
+                url.set("https://github.com/gliter/flink-schema-resolving-avro-type-serializer")
                 licenses { license { name.set("The Apache License, Version 2.0"); url.set("https://www.apache.org/licenses/LICENSE-2.0.txt") } }
                 developers { developer { id.set("gliter"); name.set("gliter") } }
                 scm {
-                    connection.set("scm:git:git://github.com/gliter/flink-confluent-avro-type-serializer.git")
-                    developerConnection.set("scm:git:ssh://github.com/gliter/flink-confluent-avro-type-serializer.git")
-                    url.set("https://github.com/gliter/flink-confluent-avro-type-serializer")
+                    connection.set("scm:git:git://github.com/gliter/flink-schema-resolving-avro-type-serializer.git")
+                    developerConnection.set("scm:git:ssh://github.com/gliter/flink-schema-resolving-avro-type-serializer.git")
+                    url.set("https://github.com/gliter/flink-schema-resolving-avro-type-serializer")
                 }
             }
         }
