@@ -41,6 +41,19 @@ class LegacyFrameAnalysisTest {
         assertFalse(LegacyFrameAnalysis.canBeShorterThanMagic(NULL_ONLY, 0));
     }
 
+    @org.junit.jupiter.api.Test
+    void automaticMagicRespectsConfiguredLimit() {
+        assertTrue(LegacyFrameAnalysis.chooseFrameMagic(ARRAY_FIRST, null, false, 4).requiresMigration());
+        assertEquals(5, LegacyFrameAnalysis.chooseFrameMagic(ARRAY_FIRST, null, false, 5).magic().length);
+        Schema longThenBoolean = record("{\"name\":\"n\",\"type\":\"long\"},{\"name\":\"b\",\"type\":\"boolean\"}");
+        assertTrue(LegacyFrameAnalysis.chooseFrameMagic(longThenBoolean, null, false, 8).requiresMigration());
+        assertEquals(9, LegacyFrameAnalysis.chooseFrameMagic(longThenBoolean, null, false, 9).magic().length);
+        assertTrue(LegacyFrameAnalysis.chooseFrameMagic(LONG_AND_DOUBLE, null, true, 5).requiresMigration());
+        assertEquals(6, LegacyFrameAnalysis.chooseFrameMagic(LONG_AND_DOUBLE, null, true, 6).magic().length);
+        org.junit.jupiter.api.Assertions.assertThrows(IllegalArgumentException.class,
+                () -> LegacyFrameAnalysis.chooseFrameMagic(STRING_FIRST, null, false, 17));
+    }
+
     static Stream<Arguments> safetyChecks() {
         return Stream.of(
                 Arguments.of("string first never starts above 0x7F", STRING_FIRST, "FF", false, false),

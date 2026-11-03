@@ -214,7 +214,7 @@ public final class SchemaResolvingAvroSerializerSnapshot<T extends IndexedRecord
         }
 
         FrameMagicChoice choice = LegacyFrameAnalysis.chooseFrameMagic(previousSchema, currentSerializer.configuredFrameMagic(),
-                currentSerializer.useUnsafeMagic());
+                currentSerializer.useUnsafeMagic(), currentSerializer.maxMagicLength());
         if (choice.requiresMigration()) {
             LOG.warn("Cannot read {} in place: {}", stateDescription, choice.explanation());
             if (currentSerializer.allowFullMigration()) return forceMigration(stateDescription);

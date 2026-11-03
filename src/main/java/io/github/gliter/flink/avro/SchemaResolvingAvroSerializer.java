@@ -72,6 +72,7 @@ public final class SchemaResolvingAvroSerializer<T extends IndexedRecord> extend
     /** Longer frame magic for legacy writer schemas whose values may start with any byte. */
     static final byte[] HEURISTIC_FRAME_MAGIC = { 'S', 'R', 'A', 'V', 'R', 'O' };
     static final byte WIRE_VERSION = 1;
+    static final String MAX_MAGIC_LENGTH = "max.magic.length";
     static final String ALLOW_FULL_MIGRATION = "allow.full.migration";
     static final String USE_UNSAFE_MAGIC = "use.unsafe.magic";
     static final String FRAME_MAGIC = "frame.magic";
@@ -124,6 +125,7 @@ public final class SchemaResolvingAvroSerializer<T extends IndexedRecord> extend
         this.specificClass = specificClass;
         this.readerSchema = readerSchema;
         this.serializerConfig = normalizeConfig(serializerConfig);
+        maxMagicLength();
         this.forceMigrationNonce = parseNonce(this.serializerConfig.get(FORCE_MIGRATION_NONCE));
         this.completedMigrationNonce = forceMigrationNonce;
         this.legacyWriterSchema = legacyWriterSchema;
@@ -298,6 +300,13 @@ public final class SchemaResolvingAvroSerializer<T extends IndexedRecord> extend
     public TypeSerializerSnapshot<T> snapshotConfiguration() {
         if (!readOnly) initializeSchemaHistory();
         return new SchemaResolvingAvroSerializerSnapshot<>(this);
+    }
+
+    int maxMagicLength() {
+        Object value = serializerConfig.get(MAX_MAGIC_LENGTH);
+        int length = value == null ? 8 : integerConfig(MAX_MAGIC_LENGTH, value);
+        if (length > MAX_FRAME_MAGIC_BYTES) throw new IllegalArgumentException("max.magic.length must be between 1 and 16");
+        return length;
     }
 
     boolean allowFullMigration() { return booleanConfig(ALLOW_FULL_MIGRATION, false); }
@@ -597,7 +606,7 @@ public final class SchemaResolvingAvroSerializer<T extends IndexedRecord> extend
         return switch (key) {
             case SCHEMA_REGISTRY_URL, AUTO_REGISTER_SCHEMAS, NORMALIZE_SCHEMAS, MAX_SCHEMAS_PER_SUBJECT,
                     FORCE_MIGRATION_NONCE, FRAME_MAGIC, VERIFY_SCHEMA_COMPATIBILITY,
-                    USE_UNSAFE_MAGIC, ALLOW_FULL_MIGRATION -> true;
+                    USE_UNSAFE_MAGIC, ALLOW_FULL_MIGRATION, MAX_MAGIC_LENGTH -> true;
             default -> false;
         };
     }
@@ -690,7 +699,7 @@ public final class SchemaResolvingAvroSerializer<T extends IndexedRecord> extend
     private static boolean isSerializerControlKey(String key) {
         return switch (key) {
             case AUTO_REGISTER_SCHEMAS, NORMALIZE_SCHEMAS, FORCE_MIGRATION_NONCE, FRAME_MAGIC,
-                    VERIFY_SCHEMA_COMPATIBILITY, USE_UNSAFE_MAGIC, ALLOW_FULL_MIGRATION -> true;
+                    VERIFY_SCHEMA_COMPATIBILITY, USE_UNSAFE_MAGIC, ALLOW_FULL_MIGRATION, MAX_MAGIC_LENGTH -> true;
             default -> false;
         };
     }

@@ -49,6 +49,12 @@ final class LegacyFrameAnalysis {
     }
 
     static FrameMagicChoice chooseFrameMagic(Schema legacyWriterSchema, byte[] configuredMagic, boolean useUnsafeMagic) {
+        return chooseFrameMagic(legacyWriterSchema, configuredMagic, useUnsafeMagic, MAX_AUTOMATIC_MAGIC_BYTES);
+    }
+
+    static FrameMagicChoice chooseFrameMagic(Schema legacyWriterSchema, byte[] configuredMagic,
+            boolean useUnsafeMagic, int maxMagicLength) {
+        if (maxMagicLength < 1 || maxMagicLength > 16) throw new IllegalArgumentException("max.magic.length must be between 1 and 16");
         String schemaName = legacyWriterSchema.getFullName();
         if (configuredMagic != null) {
             MagicSafety safety = check(legacyWriterSchema, configuredMagic);
@@ -69,8 +75,8 @@ final class LegacyFrameAnalysis {
             return FrameMagicChoice.of(configuredMagic, "configured frame magic " + hex
                     + " can never begin a legacy value of schema '" + schemaName + "'");
         }
-        Prefix prefix = automaticPrefix(legacyWriterSchema);
-        if (prefix.isSafeMagic() && prefix.bytes() <= MAX_AUTOMATIC_MAGIC_BYTES) {
+        Prefix prefix = automaticPrefix(legacyWriterSchema, maxMagicLength);
+        if (prefix.isSafeMagic() && prefix.bytes() <= maxMagicLength) {
             byte[] magic = new byte[prefix.bytes()];
             Arrays.fill(magic, (byte) 0xff);
             return FrameMagicChoice.of(magic, "legacy schema '" + schemaName
@@ -80,7 +86,7 @@ final class LegacyFrameAnalysis {
             return FrameMagicChoice.migration("no proven safe automatic magic for legacy schema '" + schemaName + "'");
         }
         byte[] heuristicMagic = SchemaResolvingAvroSerializer.HEURISTIC_FRAME_MAGIC;
-        if (!check(legacyWriterSchema, heuristicMagic).overReadPossible()) {
+        if (heuristicMagic.length <= maxMagicLength && !check(legacyWriterSchema, heuristicMagic).overReadPossible()) {
             return FrameMagicChoice.of(heuristicMagic, "legacy values of schema '" + schemaName
                     + "' can begin with any short byte sequence; using the " + heuristicMagic.length
                     + "-byte frame magic " + hex(heuristicMagic) + ", which a legacy value can only match by coincidence");
@@ -96,7 +102,7 @@ final class LegacyFrameAnalysis {
      */
     private record Prefix(int bytes, boolean isSafeMagic) { }
 
-    private static Prefix automaticPrefix(Schema schema) {
+    private static Prefix automaticPrefix(Schema schema, int maxMagicLength) {
         return switch (schema.getType()) {
             // A boolean is exactly 00 or 01, so FF differs on the first byte.
             case BOOLEAN -> new Prefix(1, true);
@@ -115,7 +121,7 @@ final class LegacyFrameAnalysis {
             case INT, FLOAT -> new Prefix(4, false);
             case LONG, DOUBLE -> new Prefix(8, false);
             // Fixed is arbitrary bytes with no length header, so the same rule applies.
-            case FIXED -> new Prefix(Math.min(schema.getFixedSize(), MAX_AUTOMATIC_MAGIC_BYTES + 1), false);
+            case FIXED -> new Prefix(Math.min(schema.getFixedSize(), maxMagicLength + 1), false);
             case RECORD -> {
                 // Records have no header: fields are concatenated, including nested record fields.
                 // Add preceding fixed widths to the first distinguishing field's prefix length.
@@ -125,10 +131,10 @@ final class LegacyFrameAnalysis {
                 int offset = 0;
                 boolean excludes = false;
                 for (Schema.Field field : schema.getFields()) {
-                    Prefix fieldPrefix = automaticPrefix(field.schema());
-                    offset = Math.min(MAX_AUTOMATIC_MAGIC_BYTES + 1, offset + fieldPrefix.bytes());
+                    Prefix fieldPrefix = automaticPrefix(field.schema(), maxMagicLength);
+                    offset = Math.min(maxMagicLength + 1, offset + fieldPrefix.bytes());
                     excludes = fieldPrefix.isSafeMagic();
-                    if (excludes || offset > MAX_AUTOMATIC_MAGIC_BYTES) break;
+                    if (excludes || offset > maxMagicLength) break;
                 }
                 yield new Prefix(offset, excludes);
             }
